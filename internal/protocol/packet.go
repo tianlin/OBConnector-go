@@ -252,6 +252,19 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 			var obHeaderBuf [TotalHeaderLen]byte
 			h.Encode(obHeaderBuf[:])
 
+			if c.traceWriter != nil {
+				fullFrame := make([]byte, 0, TotalHeaderLen+len(payloadBuf)+OB20TailLen)
+				fullFrame = append(fullFrame, obHeaderBuf[:]...)
+				fullFrame = append(fullFrame, payloadBuf...)
+				tail := OB20PayloadChecksum(payloadBuf)
+				var tailBuf [4]byte
+				binary.LittleEndian.PutUint32(tailBuf[:], tail)
+				fullFrame = append(fullFrame, tailBuf[:]...)
+				fmt.Fprintf(c.traceWriter, "obconnector-go: tx: OB20 frame len=%d header=%s payload=%d extra=%d flag=%s\n",
+					len(fullFrame), hex.EncodeToString(obHeaderBuf[:]), payloadLen, extraLen, ob20FlagNames(flag))
+				fmt.Fprintf(c.traceWriter, "obconnector-go: tx: full hex: %s\n", hex.EncodeToString(fullFrame))
+			}
+
 			if _, err := c.rw.Write(obHeaderBuf[:]); err != nil {
 				return err
 			}
