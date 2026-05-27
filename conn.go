@@ -503,11 +503,11 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 
 func (c *Conn) connectionAttributes(hs *handshake) [][2]string {
 	attrMap := map[string]string{
-		"_client_name":      "obconnector-go",
-		"_client_version":   Version,
+		"_client_name":      "OceanBase JDBC Driver",
+		"_client_version":   "2.2.10",
 		"_os":               runtime.GOOS,
 		"_platform":         runtime.GOARCH,
-		"program_name":      os.Args[0],
+		"program_name":      "obclient",
 		"ob_server_version": hs.serverVersion,
 	}
 	for k, v := range presetAttributes(c.cfg.Preset) {

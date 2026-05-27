@@ -71,9 +71,9 @@ func TestHandshakeResponseIncludesOceanBaseOracleExtensions(t *testing.T) {
 
 	requiredAttrs := [][]byte{
 		[]byte("__mysql_client_type"),
-		[]byte("__ob_libobclient"),
+		[]byte("__ob_jdbc_client"),
 		[]byte("__ob_client_name"),
-		[]byte("OceanBase Connector/C"),
+		[]byte("OceanBase JDBC Driver"),
 		[]byte("ob_capability_flag"),
 		[]byte("__proxy_capability_flag"),
 		[]byte("__ob_client_attribute_capability_flag"),

@@ -43,10 +43,13 @@ func presetAttributes(preset string) map[string]string {
 		return attrs
 	case "connector-j":
 		return map[string]string{
-			"_client_name":    "OceanBase Connector/J",
-			"_client_version": Version,
-			"_runtime_vendor": "Go",
-			"program_name":    "obconnector-go",
+			"_client_name":        "OceanBase Connector/J",
+			"_client_version":     "2.4.14",
+			"__ob_client_name":    "OceanBase Connector/J",
+			"__ob_client_version": "2.4.14",
+			"__mysql_client_type": "__ob_jdbc_client",
+			"_runtime_vendor":     "Go",
+			"program_name":        "obconnector-go",
 		}
 	default:
 		return obConnectorCAttributes()
@@ -61,11 +64,11 @@ func obConnectorCAttributes() map[string]string {
 	attrCaps := obClientCapOBLOBLocatorV2 | obClientCapSupportJDBCBinaryDouble
 
 	return map[string]string{
-		"_client_name":                          "libmariadb",
-		"_client_version":                       Version,
-		"__mysql_client_type":                   "__ob_libobclient",
-		"__ob_client_name":                      "OceanBase Connector/C",
-		"__ob_client_version":                   Version,
+		"_client_name":                          "OceanBase JDBC Driver",
+		"_client_version":                       "2.2.10",
+		"__mysql_client_type":                   "__ob_jdbc_client",
+		"__ob_client_name":                      "OceanBase JDBC Driver",
+		"__ob_client_version":                   "2.2.10",
 		"ob_capability_flag":                    formatUint64(proxyCaps),
 		"__proxy_capability_flag":               formatUint64(proxyCaps),
 		"__ob_client_attribute_capability_flag": formatUint64(attrCaps),
