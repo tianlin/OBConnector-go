@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/helingjun/obconnector-go/internal/protocol"
@@ -27,13 +28,14 @@ type Conn struct {
 	netConn       net.Conn
 	packets       *protocol.PacketConn
 	cfg           *Config
-	db            string // current database
+	db            string
 	ob20Confirmed bool
 	ob20Declined  bool
+	tenantMode    string
 
 	mu     sync.Mutex
 	closed bool
-	bad    bool
+	bad    atomic.Bool
 	inTx   bool
 }
 
@@ -51,31 +53,38 @@ func dialAndHandshake(ctx context.Context, cfg *Config) (*Conn, error) {
 	if cfg.Timeout > 0 {
 		d.Timeout = cfg.Timeout
 	}
-	netConn, err := d.DialContext(ctx, "tcp", cfg.Addr)
-	if err != nil {
-		return nil, err
-	}
 
-	c := &Conn{
-		netConn: netConn,
-		packets: protocol.NewPacketConn(netConn),
-		cfg:     cfg,
-	}
-	if cfg.Trace && cfg.TraceWriter != nil {
-		c.packets.SetTraceWriter(cfg.TraceWriter)
-	}
-	if err := c.withDeadline(ctx, func() error { return c.handshake() }); err != nil {
-		_ = netConn.Close()
-		return nil, err
-	}
-	for _, query := range cfg.InitSQL {
-		c.tracef("init query: %s", query)
-		if _, err := c.execLocked(ctx, query); err != nil {
-			_ = netConn.Close()
-			return nil, fmt.Errorf("init query %q failed: %w", query, err)
+	var lastErr error
+	for _, addr := range cfg.Addrs {
+		netConn, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			lastErr = err
+			continue
 		}
+
+		c := &Conn{
+			netConn: netConn,
+			packets: protocol.NewPacketConn(netConn),
+			cfg:     cfg,
+		}
+		if cfg.Trace && cfg.TraceWriter != nil {
+			c.packets.SetTraceWriter(cfg.TraceWriter)
+		}
+		if err := c.withDeadline(ctx, func() error { return c.handshake() }); err != nil {
+			_ = netConn.Close()
+			lastErr = err
+			continue
+		}
+		for _, query := range cfg.InitSQL {
+			c.tracef("init query: %s", query)
+			if _, err := c.execLocked(ctx, query); err != nil {
+				_ = netConn.Close()
+				return nil, fmt.Errorf("init query %q failed: %w", query, err)
+			}
+		}
+		return c, nil
 	}
-	return c, nil
+	return nil, lastErr
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
@@ -162,13 +171,16 @@ func (c *Conn) Close() error {
 	c.packets.ResetSequence()
 	c.packets.NextRequest()
 	_ = c.packets.WritePacket([]byte{protocol.ComQuit})
-	return c.netConn.Close()
+	err := c.netConn.Close()
+	c.netConn = nil
+	c.packets = nil
+	return err
 }
 
 func (c *Conn) closeStmt(stmtID uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed || c.bad {
+	if c.closed || c.bad.Load() {
 		return nil
 	}
 	c.packets.ResetSequence()
@@ -182,7 +194,7 @@ func (c *Conn) closeStmt(stmtID uint32) error {
 func (c *Conn) IsValid() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.closed && !c.bad
+	return !c.closed && !c.bad.Load()
 }
 
 func (c *Conn) ResetSession(ctx context.Context) error {
@@ -224,11 +236,27 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 }
 
 func (c *Conn) Ping(ctx context.Context) error {
-	rows, err := c.QueryContext(ctx, "select 1 from dual", nil)
-	if err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.checkUsableLocked(); err != nil {
 		return err
 	}
-	return rows.Close()
+	err := c.withDeadline(ctx, func() error {
+		c.packets.ResetSequence()
+		c.packets.NextRequest()
+		if err := c.packets.WritePacket([]byte{protocol.ComPing}); err != nil {
+			return err
+		}
+		packet, err := c.packets.ReadPacket()
+		if err != nil {
+			return err
+		}
+		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
+			return parseServerError(packet)
+		}
+		return nil
+	})
+	return c.markBadIfConnErr(err)
 }
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -276,7 +304,6 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *Conn) CheckNamedValue(v *driver.NamedValue) error {
-	// Let sql.Out pass through to ExecContext/QueryContext
 	switch v.Value.(type) {
 	case sql.Out, *sql.Out:
 		return nil
@@ -309,7 +336,12 @@ func (c *Conn) handshake() error {
 		len(hs.authSeed),
 	)
 
-	// TLS upgrade if requested and supported
+	if hs.status&0x0004 != 0 {
+		c.tenantMode = "oracle"
+	} else {
+		c.tenantMode = "mysql"
+	}
+
 	if c.cfg.TLSConfig != nil {
 		if hs.capabilities&protocol.ClientSSL == 0 {
 			return errors.New("oceanbase: server does not support SSL")
@@ -350,6 +382,10 @@ func (c *Conn) handshake() error {
 		return err
 	}
 
+	return c.handleAuthResult(hs)
+}
+
+func (c *Conn) handleAuthResult(hs *handshake) error {
 	authResult, err := c.packets.ReadPacket()
 	if err != nil {
 		return err
@@ -357,6 +393,7 @@ func (c *Conn) handshake() error {
 	if len(authResult) == 0 {
 		return io.ErrUnexpectedEOF
 	}
+
 	switch authResult[0] {
 	case protocol.OKPacket:
 		c.tracef("auth result: OK")
@@ -371,13 +408,82 @@ func (c *Conn) handshake() error {
 			c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x, NewExtraInfo: true)", hs.connectionID, magic)
 			c.packets.EnableOB20(hs.connectionID, magic, true)
 		}
+		envOverride := os.Getenv("OB_USE_COMPRESSION")
+		negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)
+		if negotiatedCompress {
+			c.packets.EnableCompression()
+		}
 		return nil
 	case protocol.ErrPacket:
 		c.tracef("auth result: ERR")
 		return parseServerError(authResult)
+	case 0x01:
+		if len(authResult) < 2 {
+			return fmt.Errorf("oceanbase: unexpected auth response 0x01 (too short)")
+		}
+		switch authResult[1] {
+		case 0x03:
+			c.tracef("auth result: auth-switch request (0x01 0x03)")
+			plugin, seed, err := c.readAuthSwitchData()
+			if err != nil {
+				return err
+			}
+			hs.authPlugin = plugin
+			hs.authSeed = seed
+			authResp, err := buildAuthResponse(hs.authPlugin, c.cfg.Password, hs.authSeed)
+			if err != nil {
+				return err
+			}
+			if err := c.packets.WritePacket(authResp); err != nil {
+				return err
+			}
+			return c.handleAuthResult(hs)
+		case 0x04:
+			c.tracef("auth result: caching_sha2_password full-auth required")
+			if c.cfg.TLSConfig != nil {
+				if err := c.packets.WritePacket([]byte(c.cfg.Password)); err != nil {
+					return err
+				}
+				return c.handleAuthResult(hs)
+			}
+			return fmt.Errorf("oceanbase: caching_sha2_password full-auth requires TLS")
+		default:
+			return fmt.Errorf("oceanbase: unexpected auth sub-response 0x01 0x%02x", authResult[1])
+		}
+	case 0xFE:
+		c.tracef("auth result: classic auth-switch request (0xFE)")
+		plugin, seed, err := c.readAuthSwitchData()
+		if err != nil {
+			return err
+		}
+		hs.authPlugin = plugin
+		hs.authSeed = seed
+		authResp, err := buildAuthResponse(hs.authPlugin, c.cfg.Password, hs.authSeed)
+		if err != nil {
+			return err
+		}
+		if err := c.packets.WritePacket(authResp); err != nil {
+			return err
+		}
+		return c.handleAuthResult(hs)
 	default:
 		return fmt.Errorf("oceanbase: unexpected auth response 0x%02x", authResult[0])
 	}
+}
+
+func (c *Conn) readAuthSwitchData() (string, []byte, error) {
+	packet, err := c.packets.ReadPacket()
+	if err != nil {
+		return "", nil, err
+	}
+	pos := 0
+	plugin, used, err := readNullTerminated(packet[pos:])
+	if err != nil {
+		return "", nil, err
+	}
+	pos += used
+	seed := append([]byte(nil), packet[pos:]...)
+	return plugin, seed, nil
 }
 
 func (c *Conn) sendSSLRequest() error {
@@ -392,6 +498,7 @@ func (c *Conn) sendSSLRequest() error {
 		protocol.ClientConnectAttrs |
 		protocol.ClientSessionTrack |
 		protocol.ClientSupportOracleMode |
+		protocol.ClientCanHandleExpiredPasswords |
 		protocol.ClientSSL
 
 	payload := make([]byte, 32)
@@ -425,7 +532,8 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 		protocol.ClientPluginAuthLenencClientData |
 		protocol.ClientConnectAttrs |
 		protocol.ClientSessionTrack |
-		protocol.ClientSupportOracleMode
+		protocol.ClientSupportOracleMode |
+		protocol.ClientCanHandleExpiredPasswords
 	if c.cfg.TLSConfig != nil {
 		baseCaps |= protocol.ClientSSL
 	}
@@ -440,14 +548,12 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 	caps |= c.cfg.CapabilityAdd
 	caps &^= c.cfg.CapabilityDrop
 
-	// Negotiate compression
 	envOverride := os.Getenv("OB_USE_COMPRESSION")
 	negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)
 	if negotiatedCompress {
 		caps |= protocol.ClientCompress
 	}
 
-	// Format negotiation logs
 	clientWants := c.cfg.UseCompression && !isEnvClosed(envOverride)
 	serverSupports := hs.capabilities&protocol.ClientCompress != 0
 	c.tracef("Compression negotiation: client=%s, server=%s -> %s",
@@ -468,8 +574,6 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 	out = binary.LittleEndian.AppendUint32(out, caps)
 	out = binary.LittleEndian.AppendUint32(out, protocol.DefaultMaxPacketSize)
 	out = append(out, c.cfg.Collation)
-	// Reserved (23 bytes): 19 bytes of zeros + 4 bytes of extended client capabilities
-	// (lower 32-bit of ob_capability_flag) in Little-Endian.
 	out = append(out, make([]byte, 19)...)
 	proxyCaps := obClientCapFullLinkTrace |
 		obClientCapProxyNewExtraInfo |
@@ -482,7 +586,11 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 	out = append(out, 0x00)
 	out = protocol.PutLengthEncodedString(out, string(authResp))
 	if caps&protocol.ClientConnectWithDB != 0 {
-		out = append(out, c.cfg.Database...)
+		dbName := c.cfg.Database
+		if c.tenantMode == "oracle" {
+			dbName = strings.ToUpper(dbName)
+		}
+		out = append(out, dbName...)
 		out = append(out, 0x00)
 	}
 	if caps&protocol.ClientPluginAuth != 0 {
@@ -545,6 +653,30 @@ func (c *Conn) connectionAttributes(hs *handshake) [][2]string {
 	return attrs
 }
 
+func unwrapOutParam(val any) any {
+	if out, ok := val.(sql.Out); ok {
+		return derefValue(out.Dest)
+	}
+	if out, ok := val.(*sql.Out); ok {
+		return derefValue(out.Dest)
+	}
+	return val
+}
+
+func derefValue(val any) any {
+	if val == nil {
+		return nil
+	}
+	v := reflect.ValueOf(val)
+	for v.Kind() == reflect.Ptr && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.IsValid() {
+		return v.Interface()
+	}
+	return val
+}
+
 func (c *Conn) stmtQueryLocked(ctx context.Context, stmtID uint32, args []driver.NamedValue) (driver.Rows, error) {
 	var rows driver.Rows
 	err := c.withDeadline(ctx, func() error {
@@ -591,11 +723,14 @@ func (c *Conn) stmtExecLocked(ctx context.Context, stmtID uint32, args []driver.
 					return err
 				}
 			}
+			if status&protocol.ServerMoreResultsExists != 0 {
+				if err := c.drainRemainingResults(); err != nil {
+					return err
+				}
+			}
 		case protocol.ErrPacket:
 			return parseServerError(first)
 		default:
-			// Exec against a SELECT-like statement: drain the result set
-			// to keep the connection usable and avoid desync.
 			res, err := c.readResultFromFirstPacket(first)
 			if err != nil {
 				return err
@@ -607,6 +742,21 @@ func (c *Conn) stmtExecLocked(ctx context.Context, stmtID uint32, args []driver.
 	return result, err
 }
 
+func (c *Conn) drainRemainingResults() error {
+	for {
+		packet, err := c.packets.ReadPacket()
+		if err != nil {
+			return err
+		}
+		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
+			return parseServerError(packet)
+		}
+		if isEOFOrOK(packet) {
+			return nil
+		}
+	}
+}
+
 func (c *Conn) readOutParams(args []driver.NamedValue) error {
 	rows, err := c.readQueryResult()
 	if err != nil {
@@ -616,7 +766,7 @@ func (c *Conn) readOutParams(args []driver.NamedValue) error {
 	if !ok {
 		return fmt.Errorf("oceanbase: unexpected rows type for OUT parameters")
 	}
-	r.binary = true // OUT parameters are returned in binary format
+	r.binary = true
 	defer r.Close()
 
 	dest := make([]driver.Value, len(r.columns))
@@ -656,8 +806,6 @@ func (c *Conn) assignOutParam(dest any, value driver.Value) error {
 	}
 
 	if value == nil {
-		// Destination is not a scanner, but value is nil.
-		// If it's a pointer, we could zero it.
 		dv := reflect.ValueOf(dest)
 		if dv.Kind() == reflect.Ptr && !dv.IsNil() {
 			dv.Elem().Set(reflect.Zero(dv.Elem().Type()))
@@ -681,7 +829,6 @@ func (c *Conn) assignOutParam(dest any, value driver.Value) error {
 		return nil
 	}
 
-	// Handle common conversions manually if needed (e.g. string to int)
 	return fmt.Errorf("oceanbase: cannot assign OUT parameter of type %T to %T", value, dest)
 }
 
@@ -696,45 +843,31 @@ func (c *Conn) stmtBulkExecLocked(ctx context.Context, stmtID uint32, argRows []
 		c.packets.ResetSequence()
 		c.packets.NextRequest()
 
-		// COM_STMT_BULK_EXECUTE (0xFA)
-		// Header: 0xFA (1) + StmtID (4) + Flags (2)
 		const SEND_TYPES_TO_SERVER uint16 = 0x80
 		header := make([]byte, 7)
 		header[0] = protocol.ComStmtBulkExecute
 		binary.LittleEndian.PutUint32(header[1:5], stmtID)
 		binary.LittleEndian.PutUint16(header[5:7], SEND_TYPES_TO_SERVER)
 
-		// Param Types (2 bytes per param)
 		numParams := len(argRows[0])
 		paramTypes := make([]byte, numParams*2)
 		for i, arg := range argRows[0] {
-			val := arg.Value
-			if out, ok := val.(sql.Out); ok {
-				val = out.Dest
-			} else if out, ok := val.(*sql.Out); ok {
-				val = out.Dest
-			}
+			val := unwrapOutParam(arg.Value)
 			binary.LittleEndian.PutUint16(paramTypes[i*2:i*2+2], uint16(protocol.GetBinaryParamType(val)))
 		}
 
-		// Payload construction
 		var payload []byte
 		payload = append(payload, header...)
 		payload = append(payload, paramTypes...)
 
 		for _, row := range argRows {
 			for _, arg := range row {
-				val := arg.Value
-				if out, ok := val.(sql.Out); ok {
-					val = out.Dest
-				} else if out, ok := val.(*sql.Out); ok {
-					val = out.Dest
-				}
+				val := unwrapOutParam(arg.Value)
 
 				if val == nil {
-					payload = append(payload, 1) // NULL
+					payload = append(payload, 1)
 				} else {
-					payload = append(payload, 0) // NOT NULL
+					payload = append(payload, 0)
 					var err error
 					payload, err = protocol.AppendBinaryParam(payload, protocol.GetBinaryParamType(val), val)
 					if err != nil {
@@ -766,38 +899,27 @@ func (c *Conn) writeExecute(stmtID uint32, args []driver.NamedValue) error {
 	c.packets.ResetSequence()
 	c.packets.NextRequest()
 
-	// COM_STMT_EXECUTE
-	// 0x17 (1) + StmtID (4) + Flags (1) + Iteration (4)
 	payload := make([]byte, 10)
 	payload[0] = protocol.ComStmtExecute
 	binary.LittleEndian.PutUint32(payload[1:5], stmtID)
-	payload[5] = 0 // Flags: CURSOR_TYPE_READ_ONLY = 0
+	payload[5] = 0
 	binary.LittleEndian.PutUint32(payload[6:10], 1)
 
 	if len(args) > 0 {
-		// NULL bitmap
 		nullBitmap := make([]byte, (len(args)+7)/8)
 		newParamsBound := byte(1)
 		paramTypes := make([]byte, len(args)*2)
 		var paramValues []byte
 
 		for i, arg := range args {
-			val := arg.Value
-			// Handle sql.Out
-			if out, ok := val.(sql.Out); ok {
-				val = out.Dest
-				// If it's a pointer to a pointer, or similar, we might need to dereference.
-				// For now, let's just handle simple types.
-			} else if out, ok := val.(*sql.Out); ok {
-				val = out.Dest
-			}
+			val := unwrapOutParam(arg.Value)
 
 			if val == nil {
 				nullBitmap[i/8] |= 1 << (uint(i) % 8)
 			}
 			typ := protocol.GetBinaryParamType(val)
 			paramTypes[i*2] = typ
-			paramTypes[i*2+1] = 0 // unsigned flag
+			paramTypes[i*2+1] = 0
 
 			var err error
 			paramValues, err = protocol.AppendBinaryParam(paramValues, typ, val)
@@ -881,7 +1003,7 @@ func (c *Conn) tracef(format string, args ...any) {
 }
 
 func (c *Conn) checkUsableLocked() error {
-	if c.closed || c.bad {
+	if c.closed || c.bad.Load() {
 		return driver.ErrBadConn
 	}
 	return nil
@@ -892,7 +1014,7 @@ func (c *Conn) markBadIfConnErr(err error) error {
 		return nil
 	}
 	if isBadConnError(err) {
-		c.bad = true
+		c.bad.Store(true)
 		return driver.ErrBadConn
 	}
 	return err
@@ -926,11 +1048,36 @@ func (c *Conn) withDeadline(ctx context.Context, fn func() error) error {
 	err := fn()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			c.bad = true
+			c.bad.Store(true)
 			return ctxErr
 		}
 	}
 	return err
+}
+
+func (c *Conn) TenantMode() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tenantMode
+}
+
+func (c *Conn) resetStmt(stmtID uint32) error {
+	c.packets.ResetSequence()
+	c.packets.NextRequest()
+	payload := make([]byte, 5)
+	payload[0] = protocol.ComStmtReset
+	binary.LittleEndian.PutUint32(payload[1:], stmtID)
+	if err := c.packets.WritePacket(payload); err != nil {
+		return err
+	}
+	packet, err := c.packets.ReadPacket()
+	if err != nil {
+		return err
+	}
+	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
+		return parseServerError(packet)
+	}
+	return nil
 }
 
 func parseHandshake(packet []byte) (*handshake, error) {
@@ -1069,7 +1216,7 @@ func (c *Conn) handleStateChange(data []byte) error {
 		pos += used
 
 		switch typ {
-		case 0x00, 0x26: // SESSION_TRACK_SYSTEM_VARIABLES and OceanBase Extra Info
+		case 0x00, 0x26:
 			pos2 := 0
 			for pos2 < len(val) {
 				k, u, _, err := protocol.ReadLengthEncodedString(val[pos2:])
@@ -1095,7 +1242,7 @@ func (c *Conn) handleStateChange(data []byte) error {
 					}
 				}
 			}
-		case 0x01: // SESSION_TRACK_SCHEMA
+		case 0x01:
 			c.db = string(val)
 			c.tracef("database change: %s", c.db)
 		}

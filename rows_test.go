@@ -37,6 +37,10 @@ func TestRowsColumnTypes(t *testing.T) {
 	rows := &Rows{
 		columns: []string{"id", "payload"},
 		types:   []byte{protocol.ColumnTypeLongLong, protocol.ColumnTypeBlob},
+		colDefs: []columnDef{
+			{name: "id", typ: protocol.ColumnTypeLongLong, flags: notNullFlag},
+			{name: "payload", typ: protocol.ColumnTypeBlob, flags: 0},
+		},
 	}
 	if got := rows.ColumnTypeDatabaseTypeName(0); got != "BIGINT" {
 		t.Fatalf("type name = %q", got)
@@ -46,6 +50,49 @@ func TestRowsColumnTypes(t *testing.T) {
 	}
 	if got := rows.ColumnTypeScanType(1); got != reflect.TypeOf([]byte{}) {
 		t.Fatalf("blob scan type = %v", got)
+	}
+}
+
+func TestRowsColumnTypeNullable(t *testing.T) {
+	rows := &Rows{
+		columns: []string{"id", "payload"},
+		types:   []byte{protocol.ColumnTypeLongLong, protocol.ColumnTypeBlob},
+		colDefs: []columnDef{
+			{name: "id", typ: protocol.ColumnTypeLongLong, flags: notNullFlag},
+			{name: "payload", typ: protocol.ColumnTypeBlob, flags: 0},
+		},
+	}
+	nullable, ok := rows.ColumnTypeNullable(0)
+	if !ok || nullable {
+		t.Fatalf("id should be NOT NULL, got nullable=%v ok=%v", nullable, ok)
+	}
+	nullable, ok = rows.ColumnTypeNullable(1)
+	if !ok || !nullable {
+		t.Fatalf("payload should be nullable, got nullable=%v ok=%v", nullable, ok)
+	}
+}
+
+func TestRowsColumnTypeLength(t *testing.T) {
+	rows := &Rows{
+		colDefs: []columnDef{
+			{name: "id", typ: protocol.ColumnTypeLongLong, columnLength: 20},
+		},
+	}
+	length, ok := rows.ColumnTypeLength(0)
+	if !ok || length != 20 {
+		t.Fatalf("length = %d, ok = %v, want 20, true", length, ok)
+	}
+}
+
+func TestRowsColumnTypePrecisionScale(t *testing.T) {
+	rows := &Rows{
+		colDefs: []columnDef{
+			{name: "val", typ: protocol.ColumnTypeNewDecimal, columnLength: 10, decimals: 2},
+		},
+	}
+	precision, scale, ok := rows.ColumnTypePrecisionScale(0)
+	if !ok || precision != 10 || scale != 2 {
+		t.Fatalf("precision=%d scale=%d ok=%v, want 10, 2, true", precision, scale, ok)
 	}
 }
 

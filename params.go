@@ -34,6 +34,9 @@ func interpolateParams(query string, args []driver.NamedValue) (string, error) {
 			case '"':
 				state = sqlDoubleQuote
 				out.WriteByte(ch)
+			case '`':
+				state = sqlBacktick
+				out.WriteByte(ch)
 			case '-':
 				if i+1 < len(query) && query[i+1] == '-' {
 					state = sqlLineComment
@@ -78,6 +81,11 @@ func interpolateParams(query string, args []driver.NamedValue) (string, error) {
 			if ch == '"' {
 				state = sqlNormal
 			}
+		case sqlBacktick:
+			out.WriteByte(ch)
+			if ch == '`' {
+				state = sqlNormal
+			}
 		case sqlLineComment:
 			out.WriteByte(ch)
 			if ch == '\n' {
@@ -110,6 +118,8 @@ func countPlaceholders(query string) int {
 				state = sqlSingleQuote
 			case '"':
 				state = sqlDoubleQuote
+			case '`':
+				state = sqlBacktick
 			case '-':
 				if i+1 < len(query) && query[i+1] == '-' {
 					i++
@@ -135,6 +145,10 @@ func countPlaceholders(query string) int {
 			if ch == '"' {
 				state = sqlNormal
 			}
+		case sqlBacktick:
+			if ch == '`' {
+				state = sqlNormal
+			}
 		case sqlLineComment:
 			if ch == '\n' {
 				state = sqlNormal
@@ -155,6 +169,7 @@ const (
 	sqlNormal sqlState = iota
 	sqlSingleQuote
 	sqlDoubleQuote
+	sqlBacktick
 	sqlLineComment
 	sqlBlockComment
 )

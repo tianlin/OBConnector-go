@@ -12,11 +12,11 @@ func TestIsValid(t *testing.T) {
 	if !conn.IsValid() {
 		t.Fatal("new connection should be valid")
 	}
-	conn.bad = true
+	conn.bad.Store(true)
 	if conn.IsValid() {
 		t.Fatal("bad connection should be invalid")
 	}
-	conn.bad = false
+	conn.bad.Store(false)
 	conn.closed = true
 	if conn.IsValid() {
 		t.Fatal("closed connection should be invalid")
@@ -24,7 +24,8 @@ func TestIsValid(t *testing.T) {
 }
 
 func TestCheckUsableLocked(t *testing.T) {
-	conn := &Conn{bad: true}
+	conn := &Conn{}
+	conn.bad.Store(true)
 	if err := conn.checkUsableLocked(); !errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("err = %v, want ErrBadConn", err)
 	}
@@ -35,7 +36,7 @@ func TestMarkBadIfConnErr(t *testing.T) {
 	if err := conn.markBadIfConnErr(io.ErrUnexpectedEOF); !errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("err = %v, want ErrBadConn", err)
 	}
-	if !conn.bad {
+	if !conn.bad.Load() {
 		t.Fatal("connection should be marked bad")
 	}
 }
@@ -46,7 +47,12 @@ func TestServerErrorIsNotBadConn(t *testing.T) {
 	if got := conn.markBadIfConnErr(err); got != err {
 		t.Fatalf("server error changed: %v", got)
 	}
-	if conn.bad {
+	if conn.bad.Load() {
 		t.Fatal("server error should not mark bad connection")
 	}
+}
+
+func TestBadFieldIsAtomic(t *testing.T) {
+	conn := &Conn{}
+	_ = conn.bad.Load()
 }

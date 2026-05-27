@@ -1,13 +1,14 @@
 package protocol
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"strings"
-	"sync"
 )
 
 // SeqError is returned when a packet's sequence number doesn't match expectations.
@@ -28,37 +29,19 @@ var _ net.Error = (*SeqError)(nil)
 
 const maxPayloadLen = 1<<24 - 1
 
-var bufPool = sync.Pool{
-	New: func() any {
-		return make([]byte, 4096)
-	},
-}
-
-func getBuf(size int) []byte {
-	if size > 4096 {
-		return make([]byte, size)
-	}
-	buf := bufPool.Get().([]byte)
-	return buf[:size]
-}
-
-func putBuf(buf []byte) {
-	if cap(buf) == 4096 {
-		bufPool.Put(buf[:4096])
-	}
-}
-
 type PacketConn struct {
-	rw              io.ReadWriter
-	seq             byte
-	ob20            bool
-	ob20Magic       uint16
-	connectionID    uint32
-	requestID       uint32
-	extraInfos      []OB20ExtraInfo
-	mysqlBuf        []byte
+	rw               io.ReadWriter
+	seq              byte
+	ob20             bool
+	ob20Magic        uint16
+	connectionID     uint32
+	requestID        uint32
+	extraInfos       []OB20ExtraInfo
+	mysqlBuf         []byte
 	ob20NewExtraInfo bool
-	traceWriter     io.Writer
+	traceWriter      io.Writer
+	compressed       bool
+	compressBuf      bytes.Buffer
 }
 
 func NewPacketConn(rw io.ReadWriter) *PacketConn {
@@ -96,7 +79,6 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 	var out []byte
 	for {
 		if c.ob20 {
-			// Step A: try to pop a MySQL packet from c.mysqlBuf first
 			if len(c.mysqlBuf) >= 4 {
 				mysqlLen := int(c.mysqlBuf[0]) | int(c.mysqlBuf[1])<<8 | int(c.mysqlBuf[2])<<16
 				if len(c.mysqlBuf) >= 4+mysqlLen {
@@ -111,7 +93,6 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 				}
 			}
 
-			// Step B: read one OB20 frame from c.rw
 			var obHeader [TotalHeaderLen]byte
 			if _, err := io.ReadFull(c.rw, obHeader[:]); err != nil {
 				c.dumpRawRX("read OB20 header failed", obHeader[:], err)
@@ -142,7 +123,6 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 				return nil, fmt.Errorf("invalid OB 2.0 payload checksum: expected 0x%08x, got 0x%08x", expectedChecksum, OB20PayloadChecksum(obPayload))
 			}
 
-			// Parse extra info if exists
 			mysqlData := obPayload
 			if h.Flag&OB20FlagExtraInfo != 0 {
 				if len(mysqlData) < OB20ExtraLengthField {
@@ -158,6 +138,53 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 
 			c.mysqlBuf = append(c.mysqlBuf, mysqlData...)
 
+		} else if c.compressed {
+			var compressedHeader [7]byte
+			if _, err := io.ReadFull(c.rw, compressedHeader[:]); err != nil {
+				return nil, err
+			}
+			compressLen := int(compressedHeader[0]) | int(compressedHeader[1])<<8 | int(compressedHeader[2])<<16
+			_ = compressedHeader[3] // compressed sequence
+			uncompressLen := int(compressedHeader[4]) | int(compressedHeader[5])<<8 | int(compressedHeader[6])<<16
+
+			compressedPayload := make([]byte, compressLen)
+			if _, err := io.ReadFull(c.rw, compressedPayload); err != nil {
+				return nil, err
+			}
+
+			if uncompressLen == 0 {
+				out = append(out, compressedPayload...)
+				return out, nil
+			}
+
+			reader, err := zlib.NewReader(bytes.NewReader(compressedPayload))
+			if err != nil {
+				return nil, fmt.Errorf("zlib decompression failed: %w", err)
+			}
+			decompressed := make([]byte, uncompressLen)
+			if _, err := io.ReadFull(reader, decompressed); err != nil {
+				_ = reader.Close()
+				return nil, fmt.Errorf("zlib read failed: %w", err)
+			}
+			_ = reader.Close()
+
+			c.mysqlBuf = append(c.mysqlBuf, decompressed...)
+			for len(c.mysqlBuf) >= 4 {
+				mysqlLen := int(c.mysqlBuf[0]) | int(c.mysqlBuf[1])<<8 | int(c.mysqlBuf[2])<<16
+				if len(c.mysqlBuf) < 4+mysqlLen {
+					break
+				}
+				payload := c.mysqlBuf[4 : 4+mysqlLen]
+				out = append(out, payload...)
+				c.mysqlBuf = c.mysqlBuf[4+mysqlLen:]
+				c.seq++
+				if mysqlLen < maxPayloadLen {
+					return out, nil
+				}
+			}
+			if len(out) > 0 {
+				return out, nil
+			}
 		} else {
 			var header [4]byte
 			if _, err := io.ReadFull(c.rw, header[:]); err != nil {
@@ -206,7 +233,6 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 			for _, info := range c.extraInfos {
 				pos += info.Encode(payloadBuf[pos:])
 			}
-			// MySQL packet
 			mysqlPos := 4 + extraLen
 			payloadBuf[mysqlPos] = byte(chunkLen)
 			payloadBuf[mysqlPos+1] = byte(chunkLen >> 8)
@@ -225,7 +251,7 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 
 		if c.ob20 {
 			payloadLen := uint32(len(payloadBuf))
-			compressLength := uint32(TotalHeaderLen - CompressHeaderLen + len(payloadBuf) + OB20TailLen) // 24 + payloadLen + 4
+			compressLength := uint32(TotalHeaderLen - CompressHeaderLen + len(payloadBuf) + OB20TailLen)
 
 			flag := OB20FlagLast
 			if extraLen > 0 {
@@ -277,6 +303,51 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 			binary.LittleEndian.PutUint32(obTrailer[:], tail)
 			if _, err := c.rw.Write(obTrailer[:]); err != nil {
 				return err
+			}
+		} else if c.compressed && len(payloadBuf) > 50 {
+			c.compressBuf.Reset()
+			writer := zlib.NewWriter(&c.compressBuf)
+			if _, err := writer.Write(payloadBuf); err != nil {
+				_ = writer.Close()
+				return err
+			}
+			writer.Close()
+
+			compressedPayload := c.compressBuf.Bytes()
+			uncompressLen := uint32(len(payloadBuf))
+
+			if len(compressedPayload) < len(payloadBuf) {
+				var compressedHeader [7]byte
+				compressedHeader[0] = byte(len(compressedPayload))
+				compressedHeader[1] = byte(len(compressedPayload) >> 8)
+				compressedHeader[2] = byte(len(compressedPayload) >> 16)
+				compressedHeader[3] = c.seq - 1
+				compressedHeader[4] = byte(uncompressLen)
+				compressedHeader[5] = byte(uncompressLen >> 8)
+				compressedHeader[6] = byte(uncompressLen >> 16)
+
+				if _, err := c.rw.Write(compressedHeader[:]); err != nil {
+					return err
+				}
+				if _, err := c.rw.Write(compressedPayload); err != nil {
+					return err
+				}
+			} else {
+				var compressedHeader [7]byte
+				compressedHeader[0] = byte(len(payloadBuf))
+				compressedHeader[1] = byte(len(payloadBuf) >> 8)
+				compressedHeader[2] = byte(len(payloadBuf) >> 16)
+				compressedHeader[3] = c.seq - 1
+				compressedHeader[4] = 0
+				compressedHeader[5] = 0
+				compressedHeader[6] = 0
+
+				if _, err := c.rw.Write(compressedHeader[:]); err != nil {
+					return err
+				}
+				if _, err := c.rw.Write(payloadBuf); err != nil {
+					return err
+				}
 			}
 		} else {
 			if _, err := c.rw.Write(payloadBuf); err != nil {
@@ -350,6 +421,10 @@ func (c *PacketConn) IsOB20() bool {
 
 func (c *PacketConn) ConnectionID() uint32 {
 	return c.connectionID
+}
+
+func (c *PacketConn) EnableCompression() {
+	c.compressed = true
 }
 
 func (c *PacketConn) traceOB20RX(format string, args ...any) {
