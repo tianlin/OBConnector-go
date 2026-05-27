@@ -2,6 +2,7 @@ package oceanbase
 
 import (
 	"database/sql/driver"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"reflect"
@@ -11,8 +12,20 @@ import (
 	"github.com/helingjun/obconnector-go/internal/protocol"
 )
 
+type columnDef struct {
+	name         string
+	typ          byte
+	flags        uint16
+	decimals     byte
+	columnLength uint32
+	charset      uint16
+}
+
+const notNullFlag uint16 = 0x0001
+
 type Rows struct {
 	conn      *Conn
+	colDefs   []columnDef
 	columns   []string
 	types     []byte
 	values    [][]driver.Value
@@ -65,7 +78,7 @@ func (r *Rows) drain() error {
 			return parseServerError(packet)
 		}
 	}
-	r.conn.bad = true
+	r.conn.bad.Store(true)
 	return fmt.Errorf("oceanbase: drain() exceeded %d rows, possible protocol desync", maxDrainRows)
 }
 
@@ -137,7 +150,27 @@ func (r *Rows) ColumnTypeScanType(index int) reflect.Type {
 }
 
 func (r *Rows) ColumnTypeNullable(index int) (nullable, ok bool) {
-	return true, true
+	if index < 0 || index >= len(r.colDefs) {
+		return true, true
+	}
+	return r.colDefs[index].flags&notNullFlag == 0, true
+}
+
+func (r *Rows) ColumnTypeLength(index int) (length int64, ok bool) {
+	if index < 0 || index >= len(r.colDefs) {
+		return 0, false
+	}
+	return int64(r.colDefs[index].columnLength), true
+}
+
+func (r *Rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
+	if index < 0 || index >= len(r.colDefs) {
+		return 0, 0, false
+	}
+	cd := r.colDefs[index]
+	precision = int64(cd.columnLength)
+	scale = int64(cd.decimals)
+	return precision, scale, true
 }
 
 func (c *Conn) readQueryResult() (driver.Rows, error) {
@@ -159,6 +192,7 @@ func (c *Conn) readQueryResult() (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
+	colDefs := make([]columnDef, 0, columnCount)
 	columns := make([]string, 0, columnCount)
 	types := make([]byte, 0, columnCount)
 	for i := uint64(0); i < columnCount; i++ {
@@ -166,18 +200,19 @@ func (c *Conn) readQueryResult() (driver.Rows, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, typ, err := parseColumnDefinition(packet)
+		cd, err := parseColumnDefinition(packet)
 		if err != nil {
 			return nil, err
 		}
-		columns = append(columns, name)
-		types = append(types, typ)
+		colDefs = append(colDefs, cd)
+		columns = append(columns, cd.name)
+		types = append(types, cd.typ)
 	}
 	if err := c.readEOFOrOK(); err != nil {
 		return nil, err
 	}
 
-	return &Rows{conn: c, columns: columns, types: types, streaming: true}, nil
+	return &Rows{conn: c, colDefs: colDefs, columns: columns, types: types, streaming: true}, nil
 }
 
 func (c *Conn) readResultFromFirstPacket(packet []byte) (driver.Result, error) {
@@ -186,12 +221,19 @@ func (c *Conn) readResultFromFirstPacket(packet []byte) (driver.Result, error) {
 	}
 	switch packet[0] {
 	case protocol.OKPacket:
-		res, _, err := c.handleOK(packet)
-		return res, err
+		res, status, err := c.handleOK(packet)
+		if err != nil {
+			return nil, err
+		}
+		if status&protocol.ServerMoreResultsExists != 0 {
+			if err := c.drainRemainingResults(); err != nil {
+				return nil, err
+			}
+		}
+		return res, nil
 	case protocol.ErrPacket:
 		return nil, parseServerError(packet)
 	default:
-		// Exec can still be called with a SELECT. Drain the result set to keep the connection usable.
 		if _, err := c.readQueryResultAfterColumnCount(packet); err != nil {
 			return nil, err
 		}
@@ -212,16 +254,18 @@ func (c *Conn) readQueryResultAfterColumnCount(first []byte) (driver.Rows, error
 	if err := c.readEOFOrOK(); err != nil {
 		return nil, err
 	}
-	for {
+	const maxDrainRows = 10000
+	for i := 0; i < maxDrainRows; i++ {
 		packet, err := c.packets.ReadPacket()
 		if err != nil {
 			return nil, err
 		}
 		if isEOFOrOK(packet) {
-			break
+			return &Rows{}, nil
 		}
 	}
-	return &Rows{}, nil
+	c.bad.Store(true)
+	return nil, fmt.Errorf("oceanbase: readQueryResultAfterColumnCount exceeded %d rows, possible protocol desync", maxDrainRows)
 }
 
 func (c *Conn) readEOFOrOK() error {
@@ -246,47 +290,49 @@ func isEOFOrOK(packet []byte) bool {
 	case protocol.ErrPacket:
 		return false
 	case protocol.OKPacket:
-		// OK packet: 0x00 + affected_rows(lenenc) + last_insert_id(lenenc) + [status(2) + ...]
-		// Try to parse affected_rows. If parsing succeeds, it's an OK packet (not a row).
-		// A bare 0x00 is a valid minimal OK packet.
 		_, used, _, err := protocol.ReadLengthEncodedInt(packet[1:])
 		if err != nil {
 			return false
 		}
-		// Try to parse last_insert_id — an OK packet always has this field.
 		_, _, _, err = protocol.ReadLengthEncodedInt(packet[1+used:])
 		return err == nil
 	case protocol.EOFPacket:
-		// EOF packet: 0xFE + status(2) + warnings(2) = 5 bytes minimum in MySQL 5.7+
-		// Contextually, 0xFE always means EOF after the column-definition or row-data phase.
 		return true
 	}
 	return false
 }
 
-func parseColumnDefinition(packet []byte) (name string, typ byte, err error) {
+func parseColumnDefinition(packet []byte) (columnDef, error) {
 	pos := 0
 	for i := 0; i < 4; i++ {
 		_, used, _, err := protocol.ReadLengthEncodedString(packet[pos:])
 		if err != nil {
-			return "", 0, err
+			return columnDef{}, err
 		}
 		pos += used
 	}
 	nameBytes, used, _, err := protocol.ReadLengthEncodedString(packet[pos:])
 	if err != nil {
-		return "", 0, err
+		return columnDef{}, err
 	}
 	pos += used
 	_, used, _, err = protocol.ReadLengthEncodedString(packet[pos:])
 	if err != nil {
-		return "", 0, err
+		return columnDef{}, err
 	}
 	pos += used
-	if len(packet) < pos+12 {
-		return string(nameBytes), 0, io.ErrUnexpectedEOF
+	if len(packet) < pos+13 {
+		return columnDef{name: string(nameBytes)}, io.ErrUnexpectedEOF
 	}
-	return string(nameBytes), packet[pos+5], nil
+	cd := columnDef{
+		name:         string(nameBytes),
+		charset:      binary.LittleEndian.Uint16(packet[pos+1 : pos+3]),
+		columnLength: binary.LittleEndian.Uint32(packet[pos+3 : pos+7]),
+		typ:          packet[pos+7],
+		flags:        binary.LittleEndian.Uint16(packet[pos+8 : pos+10]),
+		decimals:     packet[pos+10],
+	}
+	return cd, nil
 }
 
 func parseTextRow(packet []byte, columnCount int, types []byte) ([]driver.Value, error) {
@@ -319,11 +365,6 @@ func textValue(raw []byte, typ byte) driver.Value {
 	s := string(raw)
 	switch typ {
 	case protocol.ColumnTypeTiny, protocol.ColumnTypeShort, protocol.ColumnTypeLong, protocol.ColumnTypeInt24:
-		// Note: ColumnTypeLong is also ColumnTypeOracleNumber (3).
-		// In Oracle mode, we prefer string to preserve precision.
-		// However, without knowing the mode here, we might have a conflict.
-		// For now, let's assume if it can be parsed as int64, it's fine,
-		// but Oracle NUMBER often exceeds int64.
 		if val, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return val
 		}
@@ -336,13 +377,10 @@ func textValue(raw []byte, typ byte) driver.Value {
 	case protocol.ColumnTypeOracleNumberFloat:
 		return s
 	case protocol.ColumnTypeFloat, protocol.ColumnTypeDouble:
-		// ColumnTypeFloat is also ColumnTypeOracleBinaryFloat (4)
-		// ColumnTypeDouble is also ColumnTypeOracleBinaryDouble (5)
 		if val, err := strconv.ParseFloat(s, 64); err == nil {
 			return val
 		}
 	case protocol.ColumnTypeDecimal, protocol.ColumnTypeNewDecimal:
-		// Always return string for Decimal to preserve precision
 		return s
 	case protocol.ColumnTypeDate, protocol.ColumnTypeDateTime, protocol.ColumnTypeTimestamp,
 		protocol.ColumnTypeOracleTimestampNano, protocol.ColumnTypeOracleTimestampTZ, protocol.ColumnTypeOracleTimestampLTZ:
@@ -357,7 +395,6 @@ func textValue(raw []byte, typ byte) driver.Value {
 			}
 		}
 	case protocol.ColumnTypeTime:
-		// TIME as string (e.g. "HH:MM:SS" or "HH:MM:SS.ffffff")
 		return s
 	case protocol.ColumnTypeYear:
 		if val, err := strconv.ParseInt(s, 10, 64); err == nil {
@@ -386,13 +423,10 @@ func databaseTypeName(typ byte) string {
 	case protocol.ColumnTypeShort:
 		return "SMALLINT"
 	case protocol.ColumnTypeLong:
-		// Also ColumnTypeOracleNumber. Usually INT in MySQL.
 		return "INT"
 	case protocol.ColumnTypeFloat:
-		// Also ColumnTypeOracleBinaryFloat
 		return "FLOAT"
 	case protocol.ColumnTypeDouble:
-		// Also ColumnTypeOracleBinaryDouble
 		return "DOUBLE"
 	case protocol.ColumnTypeNull:
 		return "NULL"
@@ -444,6 +478,20 @@ func databaseTypeName(typ byte) string {
 		return "RAW"
 	case protocol.ColumnTypeOracleRowID:
 		return "ROWID"
+	case protocol.ColumnTypeOracleNumberFloat:
+		return "NUMBER"
+	case protocol.ColumnTypeOracleNVarChar2:
+		return "NVARCHAR2"
+	case protocol.ColumnTypeOracleNChar:
+		return "NCHAR"
+	case protocol.ColumnTypeOracleBlob:
+		return "BLOB"
+	case protocol.ColumnTypeOracleClob:
+		return "CLOB"
+	case protocol.ColumnTypeOracleIntervalYM:
+		return "INTERVAL YEAR TO MONTH"
+	case protocol.ColumnTypeOracleIntervalDS:
+		return "INTERVAL DAY TO SECOND"
 	default:
 		return fmt.Sprintf("TYPE_%02X", typ)
 	}

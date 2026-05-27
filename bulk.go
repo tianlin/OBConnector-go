@@ -24,8 +24,11 @@ func BulkInsert(ctx context.Context, db *sql.DB, tableName string, columns []str
 	if err == nil {
 		return res, nil
 	}
-	// Fallback to SQL rewriting
-	return bulkInsertRewrite(ctx, db, tableName, columns, values)
+	fallbackRes, fallbackErr := bulkInsertRewrite(ctx, db, tableName, columns, values)
+	if fallbackErr == nil {
+		return fallbackRes, nil
+	}
+	return nil, fmt.Errorf("native bulk insert failed: %w; rewrite fallback also failed: %v", err, fallbackErr)
 }
 
 func quoteIdent(name string) string {

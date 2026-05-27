@@ -65,6 +65,7 @@ const (
 	ComStmtClose                     byte   = 0x19
 	ComStmtReset                     byte   = 0x1a
 	ComStmtBulkExecute               byte   = 0xfa
+	ComPing                          byte   = 0x0e
 	OKPacket                         byte   = 0x00
 	ErrPacket                        byte   = 0xff
 	EOFPacket                        byte   = 0xfe
@@ -74,6 +75,7 @@ const (
 const (
 	ServerSessionStateChanged uint16 = 0x4000
 	ServerPSOutParams         uint16 = 0x1000
+	ServerMoreResultsExists   uint16 = 0x0008
 )
 
 const (

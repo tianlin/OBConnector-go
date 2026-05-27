@@ -17,6 +17,7 @@ import (
 const defaultAddr = "127.0.0.1:2881"
 
 type Config struct {
+	Addrs          []string
 	Addr           string
 	User           string
 	Password       string
@@ -47,27 +48,49 @@ func ParseDSN(dsn string) (*Config, error) {
 }
 
 func (c *Config) normalize() error {
+	if len(c.Addrs) == 0 && c.Addr != "" {
+		c.Addrs = []string{c.Addr}
+	} else if len(c.Addrs) > 0 && c.Addr == "" {
+		c.Addr = c.Addrs[0]
+	}
+
 	if c.Addr == "" {
 		c.Addr = defaultAddr
 	}
-	host, port, err := net.SplitHostPort(c.Addr)
-	if err != nil {
-		if strings.Contains(c.Addr, ":") {
-			return fmt.Errorf("invalid address %q: %w", c.Addr, err)
+	if len(c.Addrs) == 0 {
+		c.Addrs = []string{c.Addr}
+	}
+
+	normalizedAddrs := make([]string, len(c.Addrs))
+	for i, addr := range c.Addrs {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			if strings.Contains(addr, ":") {
+				return fmt.Errorf("invalid address %q: %w", addr, err)
+			}
+			host = addr
+			port = "2881"
 		}
-		host = c.Addr
-		port = "2881"
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		if _, err := strconv.Atoi(port); err != nil {
+			return fmt.Errorf("invalid port %q: %w", port, err)
+		}
+		normalizedAddrs[i] = net.JoinHostPort(host, port)
 	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return fmt.Errorf("invalid port %q: %w", port, err)
-	}
-	c.Addr = net.JoinHostPort(host, port)
+	c.Addrs = normalizedAddrs
+	c.Addr = c.Addrs[0]
 
 	if c.User == "" {
 		return errors.New("missing user")
+	}
+	if c.Timeout == 0 {
+		if envTimeout := os.Getenv("OB_TIMEOUT"); envTimeout != "" {
+			if d, err := parseTimeout(envTimeout); err == nil {
+				c.Timeout = d
+			}
+		}
 	}
 	if c.Timeout == 0 {
 		c.Timeout = 10 * time.Second
@@ -100,7 +123,7 @@ func parseURLDSN(dsn string) (*Config, error) {
 		Addr:           u.Host,
 		Database:       strings.TrimPrefix(u.EscapedPath(), "/"),
 		Attributes:     map[string]string{},
-		UseCompression: true,
+		UseCompression: false,
 	}
 	if u.Scheme == "oboracle" {
 		cfg.Preset = "oboracle"
@@ -111,6 +134,11 @@ func parseURLDSN(dsn string) (*Config, error) {
 	}
 	if db, err := url.PathUnescape(cfg.Database); err == nil {
 		cfg.Database = db
+	}
+
+	if hostPart := u.Host; strings.Contains(hostPart, ",") {
+		cfg.Addrs = strings.Split(hostPart, ",")
+		cfg.Addr = cfg.Addrs[0]
 	}
 
 	if err := applyQuery(cfg, u.Query()); err != nil {
@@ -152,7 +180,10 @@ func parseOpaqueDSN(dsn string) (*Config, error) {
 		Password:       password,
 		Database:       database,
 		Attributes:     map[string]string{},
-		UseCompression: true,
+		UseCompression: false,
+	}
+	if strings.Contains(addr, ",") {
+		cfg.Addrs = strings.Split(addr, ",")
 	}
 	if strings.HasPrefix(dsn, "oboracle:") {
 		cfg.Preset = "oboracle"
@@ -170,17 +201,28 @@ func parseOpaqueDSN(dsn string) (*Config, error) {
 }
 
 func parseLegacyDSN(dsn string) (*Config, error) {
-	// Minimal compatibility with user:pass@tcp(host:port)/db?timeout=5s.
-	cfg := &Config{Addr: defaultAddr, Attributes: map[string]string{}, UseCompression: true}
+	cfg := &Config{Addr: defaultAddr, Attributes: map[string]string{}, UseCompression: false}
 	before, after, ok := strings.Cut(dsn, "@tcp(")
 	if !ok {
 		return nil, errors.New("dsn must be oceanbase://user:pass@host:port/db or user:pass@tcp(host:port)/db")
 	}
 	if user, password, ok := strings.Cut(before, ":"); ok {
-		cfg.User = user
-		cfg.Password = password
+		if u, err := url.QueryUnescape(user); err == nil {
+			cfg.User = u
+		} else {
+			cfg.User = user
+		}
+		if p, err := url.QueryUnescape(password); err == nil {
+			cfg.Password = p
+		} else {
+			cfg.Password = password
+		}
 	} else {
-		cfg.User = before
+		if u, err := url.QueryUnescape(before); err == nil {
+			cfg.User = u
+		} else {
+			cfg.User = before
+		}
 	}
 
 	addr, rest, ok := strings.Cut(after, ")")
@@ -188,6 +230,9 @@ func parseLegacyDSN(dsn string) (*Config, error) {
 		return nil, errors.New("legacy dsn missing closing )")
 	}
 	cfg.Addr = addr
+	if strings.Contains(addr, ",") {
+		cfg.Addrs = strings.Split(addr, ",")
+	}
 	if strings.HasPrefix(rest, "/") {
 		pathAndQuery := strings.TrimPrefix(rest, "/")
 		if db, query, ok := strings.Cut(pathAndQuery, "?"); ok {

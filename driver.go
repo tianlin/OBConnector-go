@@ -41,6 +41,9 @@ func NewConnector(cfg Config) (driver.Connector, error) {
 }
 
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := c.cfg.normalize(); err != nil {
+		return nil, err
+	}
 	conn, err := dialAndHandshake(ctx, c.cfg)
 	if err != nil {
 		return nil, err
