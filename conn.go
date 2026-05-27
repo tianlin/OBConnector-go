@@ -30,6 +30,7 @@ type Conn struct {
 	db            string // current database
 	ob20Confirmed bool
 	ob20Declined  bool
+	ob20NewExtraInfoConfirmed bool
 
 	mu     sync.Mutex
 	closed bool
@@ -365,8 +366,8 @@ func (c *Conn) handshake() error {
 			if c.cfg.OB20Magic != 0 {
 				magic = c.cfg.OB20Magic
 			}
-			c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x)", hs.connectionID, magic)
-			c.packets.EnableOB20(hs.connectionID, magic)
+			c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x, NewExtraInfo: %v)", hs.connectionID, magic, c.ob20NewExtraInfoConfirmed)
+			c.packets.EnableOB20(hs.connectionID, magic, c.ob20NewExtraInfoConfirmed)
 		}
 		return nil
 	case protocol.ErrPacket:
@@ -1089,6 +1090,10 @@ func (c *Conn) handleStateChange(data []byte) error {
 					} else {
 						c.ob20Declined = true
 						c.tracef("OceanBase 2.0 protocol explicitly declined by server: %s = %d", k, capVal)
+					}
+					if capVal&protocol.OBCapNewExtraInfo != 0 {
+						c.ob20NewExtraInfoConfirmed = true
+						c.tracef("OceanBase OB20 new extra info confirmed by server: %s = %d", k, capVal)
 					}
 				}
 			}

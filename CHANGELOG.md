@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- OB20 flag `OB20FlagNewExtraInfo` is now only set when the server confirms
+  `OBCapNewExtraInfo` (1<<15) support during session state change.  Previously it
+  was unconditionally set on every OB20 frame, breaking connections through older
+  OBProxy versions that reject unknown flags.
+
+## [0.3.0] - 2026-05-25
+
 ## [0.2.1] - 2026-05-03
 
 ### Added

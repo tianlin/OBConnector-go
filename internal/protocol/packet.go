@@ -47,14 +47,15 @@ func putBuf(buf []byte) {
 }
 
 type PacketConn struct {
-	rw           io.ReadWriter
-	seq          byte
-	ob20         bool
-	ob20Magic    uint16
-	connectionID uint32
-	requestID    uint32
-	extraInfos   []OB20ExtraInfo
-	mysqlBuf     []byte
+	rw              io.ReadWriter
+	seq             byte
+	ob20            bool
+	ob20Magic       uint16
+	connectionID    uint32
+	requestID       uint32
+	extraInfos      []OB20ExtraInfo
+	mysqlBuf        []byte
+	ob20NewExtraInfo bool
 }
 
 func NewPacketConn(rw io.ReadWriter) *PacketConn {
@@ -65,10 +66,11 @@ func (c *PacketConn) ResetSequence() {
 	c.seq = 0
 }
 
-func (c *PacketConn) EnableOB20(connectionID uint32, magic uint16) {
+func (c *PacketConn) EnableOB20(connectionID uint32, magic uint16, newExtraInfo bool) {
 	c.ob20 = true
 	c.ob20Magic = magic
 	c.connectionID = connectionID
+	c.ob20NewExtraInfo = newExtraInfo
 }
 
 func (c *PacketConn) AddExtraInfo(typ uint16, data []byte) {
@@ -216,7 +218,9 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 			if extraLen > 0 {
 				flag |= OB20FlagExtraInfo
 			}
-			flag |= OB20FlagNewExtraInfo
+			if c.ob20NewExtraInfo {
+				flag |= OB20FlagNewExtraInfo
+			}
 
 			h := OB20Header{
 				CompressLength:   compressLength,
@@ -286,8 +290,11 @@ func (c *PacketConn) writeEmptyContinuation() error {
 			RequestID:        c.requestID & 0x00FFFFFF,
 			PacketSeq:        mysqlHeader[3],
 			PayloadLen:       payloadLen,
-			Flag:             OB20FlagLast | OB20FlagNewExtraInfo,
+			Flag:             OB20FlagLast,
 			Reserved:         0,
+		}
+		if c.ob20NewExtraInfo {
+			h.Flag |= OB20FlagNewExtraInfo
 		}
 
 		var obHeaderBuf [TotalHeaderLen]byte
