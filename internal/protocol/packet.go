@@ -54,6 +54,7 @@ type PacketConn struct {
 	connectionID uint32
 	requestID    uint32
 	extraInfos   []OB20ExtraInfo
+	mysqlBuf     []byte
 }
 
 func NewPacketConn(rw io.ReadWriter) *PacketConn {
@@ -86,7 +87,23 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 	var out []byte
 	for {
 		if c.ob20 {
-			var obHeader [OB20HeaderLen]byte
+			// Step A: try to pop a MySQL packet from c.mysqlBuf first
+			if len(c.mysqlBuf) >= 4 {
+				mysqlLen := int(c.mysqlBuf[0]) | int(c.mysqlBuf[1])<<8 | int(c.mysqlBuf[2])<<16
+				if len(c.mysqlBuf) >= 4+mysqlLen {
+					payload := c.mysqlBuf[4 : 4+mysqlLen]
+					out = append(out, payload...)
+					c.mysqlBuf = c.mysqlBuf[4+mysqlLen:]
+
+					if mysqlLen < maxPayloadLen {
+						return out, nil
+					}
+					continue
+				}
+			}
+
+			// Step B: read one OB20 frame from c.rw
+			var obHeader [TotalHeaderLen]byte
 			if _, err := io.ReadFull(c.rw, obHeader[:]); err != nil {
 				return nil, err
 			}
@@ -94,47 +111,38 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 			if !h.Decode(obHeader[:]) {
 				return nil, fmt.Errorf("invalid OB 2.0 header")
 			}
-			// In OB 2.0, the payload is the entire MySQL packet (header + payload)
-			// We allocate the payload as before, as it's passed back to the user
-			mysqlPacket := make([]byte, h.PayloadLen)
-			if _, err := io.ReadFull(c.rw, mysqlPacket); err != nil {
+
+			obPayload := make([]byte, h.PayloadLen)
+			if _, err := io.ReadFull(c.rw, obPayload); err != nil {
 				return nil, err
 			}
+
 			var obTrailer [4]byte
 			if _, err := io.ReadFull(c.rw, obTrailer[:]); err != nil {
 				return nil, err
 			}
-			expectedChecksum := binary.BigEndian.Uint32(obTrailer[:])
-			if OB20PayloadChecksum(mysqlPacket) != expectedChecksum {
-				return nil, fmt.Errorf("invalid OB 2.0 payload checksum")
+
+			expectedChecksum := binary.LittleEndian.Uint32(obTrailer[:])
+			if OB20PayloadChecksum(obPayload) != expectedChecksum {
+				return nil, fmt.Errorf("invalid OB 2.0 payload checksum: expected 0x%08x, got 0x%08x", expectedChecksum, OB20PayloadChecksum(obPayload))
 			}
 
-			// Extract the MySQL payload from the MySQL packet
-			if len(mysqlPacket) < 4 {
-				return nil, io.ErrUnexpectedEOF
-			}
-			mysqlLen := int(mysqlPacket[0]) | int(mysqlPacket[1])<<8 | int(mysqlPacket[2])<<16
-
-			// In OB20 mode, skip MySQL seq checking — OB20 has its own sequencing (PacketSeq/obSeqNo).
-			// The MySQL seq doesn't reset per-command in OB20 mode, so it's not reliable.
-			// c.seq is only used for non-OB20 MySQL protocol or for WritePacket output (which resets).
-			if !c.ob20 {
-				if gotSeq := mysqlPacket[3]; gotSeq != c.seq {
-					return nil, &SeqError{Got: gotSeq, Want: c.seq}
+			// Parse extra info if exists
+			mysqlData := obPayload
+			if h.Flag&OB20FlagExtraInfo != 0 {
+				if len(mysqlData) < OB20ExtraLengthField {
+					return nil, fmt.Errorf("truncated extra_length in OB20 payload")
 				}
-				c.seq++
+				extraLength := binary.LittleEndian.Uint32(mysqlData[0:4])
+				extraTotal := OB20ExtraLengthField + int(extraLength)
+				if len(mysqlData) < extraTotal {
+					return nil, fmt.Errorf("truncated extra_info: declared %d bytes, payload has %d", extraTotal, len(mysqlData))
+				}
+				mysqlData = mysqlData[extraTotal:]
 			}
 
-			// Check for Extra Info
-			if int(h.PayloadLen) > 4+mysqlLen {
-				_ = mysqlPacket[4+mysqlLen:] // Extra Data
-				// In a professional driver, we'd handle TraceID or SessionVar feedback.
-			}
+			c.mysqlBuf = append(c.mysqlBuf, mysqlData...)
 
-			out = append(out, mysqlPacket[4:4+mysqlLen]...)
-			if mysqlLen < maxPayloadLen {
-				return out, nil
-			}
 		} else {
 			var header [4]byte
 			if _, err := io.ReadFull(c.rw, header[:]); err != nil {
@@ -175,59 +183,76 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 			}
 		}
 
-		// Use pooled buffer for the write payload
-		writeBuf := getBuf(mysqlLen + extraLen)
-		writeBuf[0] = byte(chunkLen)
-		writeBuf[1] = byte(chunkLen >> 8)
-		writeBuf[2] = byte(chunkLen >> 16)
-		writeBuf[3] = c.seq
+		var payloadBuf []byte
+		if c.ob20 && extraLen > 0 {
+			payloadBuf = make([]byte, 4+extraLen+mysqlLen)
+			binary.LittleEndian.PutUint32(payloadBuf[0:4], uint32(extraLen))
+			pos := 4
+			for _, info := range c.extraInfos {
+				pos += info.Encode(payloadBuf[pos:])
+			}
+			// MySQL packet
+			mysqlPos := 4 + extraLen
+			payloadBuf[mysqlPos] = byte(chunkLen)
+			payloadBuf[mysqlPos+1] = byte(chunkLen >> 8)
+			payloadBuf[mysqlPos+2] = byte(chunkLen >> 16)
+			payloadBuf[mysqlPos+3] = c.seq
+			copy(payloadBuf[mysqlPos+4:], payload[:chunkLen])
+		} else {
+			payloadBuf = make([]byte, mysqlLen)
+			payloadBuf[0] = byte(chunkLen)
+			payloadBuf[1] = byte(chunkLen >> 8)
+			payloadBuf[2] = byte(chunkLen >> 16)
+			payloadBuf[3] = c.seq
+			copy(payloadBuf[4:], payload[:chunkLen])
+		}
 		c.seq++
-		copy(writeBuf[4:], payload[:chunkLen])
 
 		if c.ob20 {
-			if extraLen > 0 {
-				pos := mysqlLen
-				for _, info := range c.extraInfos {
-					pos += info.Encode(writeBuf[pos:])
-				}
-			}
+			payloadLen := uint32(len(payloadBuf))
+			compressLength := uint32(TotalHeaderLen - CompressHeaderLen + len(payloadBuf) + OB20TailLen) // 24 + payloadLen + 4
 
-			var obHeaderBuf [OB20HeaderLen]byte
-			flag := OB20FlagNone
+			flag := OB20FlagLast
 			if extraLen > 0 {
 				flag |= OB20FlagExtraInfo
 			}
+			flag |= OB20FlagNewExtraInfo
+
 			h := OB20Header{
-				MagicNum:     c.ob20Magic,
-				Version:      OB20Version,
-				ConnectionID: c.connectionID,
-				RequestID:    c.requestID,
-				PacketSeq:    writeBuf[3],
-				PayloadLen:   uint32(len(writeBuf)),
-				Flag:         flag,
+				CompressLength:   compressLength,
+				CompressSeqNo:    c.seq - 1,
+				UncompressLength: 0,
+				MagicNum:         c.ob20Magic,
+				Version:          OB20Version,
+				ConnectionID:     c.connectionID,
+				RequestID:        c.requestID & 0x00FFFFFF,
+				PacketSeq:        c.seq - 1,
+				PayloadLen:       payloadLen,
+				Flag:             flag,
+				Reserved:         0,
 			}
+
+			var obHeaderBuf [TotalHeaderLen]byte
 			h.Encode(obHeaderBuf[:])
+
 			if _, err := c.rw.Write(obHeaderBuf[:]); err != nil {
-				putBuf(writeBuf)
 				return err
 			}
-			if _, err := c.rw.Write(writeBuf); err != nil {
-				putBuf(writeBuf)
+			if _, err := c.rw.Write(payloadBuf); err != nil {
 				return err
 			}
+
+			tail := OB20PayloadChecksum(payloadBuf)
 			var obTrailer [4]byte
-			binary.BigEndian.PutUint32(obTrailer[:], OB20PayloadChecksum(writeBuf))
+			binary.LittleEndian.PutUint32(obTrailer[:], tail)
 			if _, err := c.rw.Write(obTrailer[:]); err != nil {
-				putBuf(writeBuf)
 				return err
 			}
 		} else {
-			if _, err := c.rw.Write(writeBuf); err != nil {
-				putBuf(writeBuf)
+			if _, err := c.rw.Write(payloadBuf); err != nil {
 				return err
 			}
 		}
-		putBuf(writeBuf)
 
 		payload = payload[chunkLen:]
 		if chunkLen < maxPayloadLen {
@@ -240,8 +265,7 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 }
 
 func (c *PacketConn) writeEmptyContinuation() error {
-	mysqlHeader := getBuf(4)
-	defer putBuf(mysqlHeader)
+	mysqlHeader := make([]byte, 4)
 	mysqlHeader[0] = 0
 	mysqlHeader[1] = 0
 	mysqlHeader[2] = 0
@@ -249,28 +273,48 @@ func (c *PacketConn) writeEmptyContinuation() error {
 	c.seq++
 
 	if c.ob20 {
-		var obHeaderBuf [OB20HeaderLen]byte
+		payloadLen := uint32(len(mysqlHeader))
+		compressLength := uint32(TotalHeaderLen - CompressHeaderLen + len(mysqlHeader) + OB20TailLen) // 24 + 4 + 4 = 32
+
 		h := OB20Header{
-			MagicNum:     c.ob20Magic,
-			Version:      OB20Version,
-			ConnectionID: c.connectionID,
-			RequestID:    c.requestID,
-			PacketSeq:    mysqlHeader[3],
-			PayloadLen:   uint32(len(mysqlHeader)),
+			CompressLength:   compressLength,
+			CompressSeqNo:    mysqlHeader[3],
+			UncompressLength: 0,
+			MagicNum:         c.ob20Magic,
+			Version:          OB20Version,
+			ConnectionID:     c.connectionID,
+			RequestID:        c.requestID & 0x00FFFFFF,
+			PacketSeq:        mysqlHeader[3],
+			PayloadLen:       payloadLen,
+			Flag:             OB20FlagLast | OB20FlagNewExtraInfo,
+			Reserved:         0,
 		}
+
+		var obHeaderBuf [TotalHeaderLen]byte
 		h.Encode(obHeaderBuf[:])
+
 		if _, err := c.rw.Write(obHeaderBuf[:]); err != nil {
 			return err
 		}
 		if _, err := c.rw.Write(mysqlHeader); err != nil {
 			return err
 		}
+
+		tail := OB20PayloadChecksum(mysqlHeader)
 		var obTrailer [4]byte
-		binary.BigEndian.PutUint32(obTrailer[:], OB20PayloadChecksum(mysqlHeader))
+		binary.LittleEndian.PutUint32(obTrailer[:], tail)
 		_, err := c.rw.Write(obTrailer[:])
 		return err
 	}
 
 	_, err := c.rw.Write(mysqlHeader)
 	return err
+}
+
+func (c *PacketConn) IsOB20() bool {
+	return c.ob20
+}
+
+func (c *PacketConn) ConnectionID() uint32 {
+	return c.connectionID
 }

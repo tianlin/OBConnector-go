@@ -29,6 +29,32 @@ const (
 	ClientSupportOracleMode          uint32 = 1 << 27
 	ClientReturnHiddenRowID          uint32 = 1 << 28
 	ClientUseLOBLocator              uint32 = 1 << 29
+
+	// OceanBase specific capabilities (64-bit space, represented as uint64)
+	OBCapPartitionTable             uint64 = 1
+	OBCapChangeUser                 uint64 = 1 << 1
+	OBCapReadWeak                   uint64 = 1 << 2
+	OBCapChecksum                   uint64 = 1 << 3
+	OBCapSafeWeakRead               uint64 = 1 << 4
+	OBCapPriorityHit                uint64 = 1 << 5
+	OBCapChecksumSwitch             uint64 = 1 << 6
+	OBCapOcjEnableExtraOkPacket     uint64 = 1 << 7
+	OBCapOBProtocolV2               uint64 = 1 << 8
+	OBCapExtraOkPacketForStatistics uint64 = 1 << 9
+	OBCapAbundantFeedback           uint64 = 1 << 10
+	OBCapPLRoute                    uint64 = 1 << 11
+	OBCapProxyReroute               uint64 = 1 << 12
+	OBCapProxySessionSync           uint64 = 1 << 13
+	OBCapFullLinkTrace              uint64 = 1 << 14
+	OBCapNewExtraInfo               uint64 = 1 << 15
+	OBCapProxySessionVarSync        uint64 = 1 << 16
+	OBCapProxyWeakStaleFeedback     uint64 = 1 << 17
+	OBCapFullLinkTraceShowTrace     uint64 = 1 << 18
+	OBCapLocalFiles                 uint64 = 1 << 20
+
+	OBClientCapLobLocatorV2      uint64 = 1
+	OBCapUseNewResultsetMetadata uint64 = 1 << 2
+
 	DefaultMaxPacketSize             uint32 = 1 << 24
 	DefaultCollationUTF8MB4GeneralCI byte   = 45
 	DefaultCollationUTF8MB4Bin       byte   = 46

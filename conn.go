@@ -15,6 +15,8 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,10 +24,12 @@ import (
 )
 
 type Conn struct {
-	netConn net.Conn
-	packets *protocol.PacketConn
-	cfg     *Config
-	db      string // current database
+	netConn       net.Conn
+	packets       *protocol.PacketConn
+	cfg           *Config
+	db            string // current database
+	ob20Confirmed bool
+	ob20Declined  bool
 
 	mu     sync.Mutex
 	closed bool
@@ -353,7 +357,10 @@ func (c *Conn) handshake() error {
 	switch authResult[0] {
 	case protocol.OKPacket:
 		c.tracef("auth result: OK")
-		if c.cfg.ProtocolV2 {
+		if _, _, err := c.handleOK(authResult); err != nil {
+			return err
+		}
+		if c.cfg.ProtocolV2 && !c.ob20Declined {
 			magic := protocol.OB20MagicNum
 			if c.cfg.OB20Magic != 0 {
 				magic = c.cfg.OB20Magic
@@ -429,6 +436,22 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 	}
 	caps |= c.cfg.CapabilityAdd
 	caps &^= c.cfg.CapabilityDrop
+
+	// Negotiate compression
+	envOverride := os.Getenv("OB_USE_COMPRESSION")
+	negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)
+	if negotiatedCompress {
+		caps |= protocol.ClientCompress
+	}
+
+	// Format negotiation logs
+	clientWants := c.cfg.UseCompression && !isEnvClosed(envOverride)
+	serverSupports := hs.capabilities&protocol.ClientCompress != 0
+	c.tracef("Compression negotiation: client=%s, server=%s -> %s",
+		boolToOnOff(clientWants),
+		boolToOnOff(serverSupports),
+		negotiationResultLabel(negotiatedCompress, clientWants, serverSupports))
+
 	c.tracef(
 		"client capabilities: base=0x%08x add=0x%08x drop=0x%08x final=0x%08x flags=%s",
 		baseCaps,
@@ -442,7 +465,16 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 	out = binary.LittleEndian.AppendUint32(out, caps)
 	out = binary.LittleEndian.AppendUint32(out, protocol.DefaultMaxPacketSize)
 	out = append(out, c.cfg.Collation)
-	out = append(out, make([]byte, 23)...)
+	// Reserved (23 bytes): 19 bytes of zeros + 4 bytes of extended client capabilities
+	// (lower 32-bit of ob_capability_flag) in Little-Endian.
+	out = append(out, make([]byte, 19)...)
+	proxyCaps := obClientCapFullLinkTrace |
+		obClientCapProxyNewExtraInfo |
+		obClientCapProxyFullLinkTraceShowTrace
+	if c.cfg.ProtocolV2 {
+		proxyCaps |= obClientCapOBProtocolV2
+	}
+	out = binary.LittleEndian.AppendUint32(out, uint32(proxyCaps))
 	out = append(out, c.cfg.User...)
 	out = append(out, 0x00)
 	out = protocol.PutLengthEncodedString(out, string(authResp))
@@ -482,6 +514,19 @@ func (c *Conn) connectionAttributes(hs *handshake) [][2]string {
 	}
 	for k, v := range c.cfg.Attributes {
 		attrMap[k] = v
+	}
+
+	if !c.cfg.ProtocolV2 {
+		if v, ok := attrMap["ob_capability_flag"]; ok {
+			capVal, _ := strconv.ParseUint(v, 10, 64)
+			capVal &^= obClientCapOBProtocolV2
+			attrMap["ob_capability_flag"] = strconv.FormatUint(capVal, 10)
+		}
+		if v, ok := attrMap["__proxy_capability_flag"]; ok {
+			capVal, _ := strconv.ParseUint(v, 10, 64)
+			capVal &^= obClientCapOBProtocolV2
+			attrMap["__proxy_capability_flag"] = strconv.FormatUint(capVal, 10)
+		}
 	}
 
 	keys := make([]string, 0, len(attrMap))
@@ -1021,12 +1066,31 @@ func (c *Conn) handleStateChange(data []byte) error {
 		pos += used
 
 		switch typ {
-		case 0x00: // SESSION_TRACK_SYSTEM_VARIABLES
-			// val contains key and value as length encoded strings
-			k, u, _, err := protocol.ReadLengthEncodedString(val)
-			if err == nil {
-				v, _, _, _ := protocol.ReadLengthEncodedString(val[u:])
-				c.tracef("session variable change: %s = %s", k, v)
+		case 0x00, 0x26: // SESSION_TRACK_SYSTEM_VARIABLES and OceanBase Extra Info
+			pos2 := 0
+			for pos2 < len(val) {
+				k, u, _, err := protocol.ReadLengthEncodedString(val[pos2:])
+				if err != nil {
+					break
+				}
+				pos2 += u
+				v, u2, _, err := protocol.ReadLengthEncodedString(val[pos2:])
+				if err != nil {
+					break
+				}
+				pos2 += u2
+
+				c.tracef("session track (type 0x%02x): %s = %s", typ, k, v)
+				if string(k) == "ob_capability_flag" || string(k) == "__proxy_capability_flag" {
+					capVal, _ := strconv.ParseUint(string(v), 10, 64)
+					if capVal&protocol.OBCapOBProtocolV2 != 0 {
+						c.ob20Confirmed = true
+						c.tracef("OceanBase 2.0 protocol confirmed by server: %s = %d", k, capVal)
+					} else {
+						c.ob20Declined = true
+						c.tracef("OceanBase 2.0 protocol explicitly declined by server: %s = %d", k, capVal)
+					}
+				}
 			}
 		case 0x01: // SESSION_TRACK_SCHEMA
 			c.db = string(val)
@@ -1034,4 +1098,69 @@ func (c *Conn) handleStateChange(data []byte) error {
 		}
 	}
 	return nil
+}
+
+func (c *Conn) IsOB20() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.packets == nil {
+		return false
+	}
+	return c.packets.IsOB20()
+}
+
+func (c *Conn) ConnectionID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.packets == nil {
+		return 0
+	}
+	return c.packets.ConnectionID()
+}
+
+func NegotiateCompression(
+	optionUseCompression bool,
+	serverCapabilityFlags uint32,
+	envOverride string,
+) bool {
+	envClosed := false
+	if envOverride != "" {
+		switch strings.ToLower(envOverride) {
+		case "0", "false", "off", "no":
+			envClosed = true
+		}
+	}
+	clientWants := optionUseCompression && !envClosed
+	serverSupports := serverCapabilityFlags&protocol.ClientCompress != 0
+	return clientWants && serverSupports
+}
+
+func isEnvClosed(env string) bool {
+	if env != "" {
+		switch strings.ToLower(env) {
+		case "0", "false", "off", "no":
+			return true
+		}
+	}
+	return false
+}
+
+func boolToOnOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+func negotiationResultLabel(negotiated, client, server bool) string {
+	if negotiated {
+		return "ENABLED"
+	}
+	if client && !server {
+		return "downgraded to uncompressed"
+	}
+	if !client && server {
+		return "uncompressed (client opted out)"
+	}
+	return "uncompressed"
 }

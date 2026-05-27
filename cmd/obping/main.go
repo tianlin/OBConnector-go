@@ -50,6 +50,7 @@ func main() {
 		mysqlMode = flag.Bool("mysql-mode", false, "force MySQL mode (equivalent to oracleMode=false in DSN)")
 		tlsFlag   = flag.Bool("tls", false, "enable TLS")
 		tlsCAFlag = flag.String("tls-ca", "", "path to CA certificate for TLS")
+		check     = flag.Bool("check", false, "run protocol detection and SQL checks")
 	)
 	flag.Var(&attrs, "attr", "connection attribute key=value; can be repeated")
 	flag.Var(&initSQL, "init", "initial SQL to run after auth; can be repeated")
@@ -90,6 +91,13 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	if *check {
+		if err := runCheck(ctx, connString); err != nil {
+			exitErr(err)
+		}
+		return
+	}
+
 	if *probe {
 		if err := probePresets(ctx, connString); err != nil {
 			exitErr(err)
@@ -1000,4 +1008,133 @@ func appendRawQuery(dsn string, values url.Values) string {
 func exitErr(err error) {
 	fmt.Fprintf(os.Stderr, "obping: %v\n", err)
 	os.Exit(1)
+}
+
+func runCheck(ctx context.Context, connString string) error {
+	db, err := openDB(connString)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// 1. Get raw connection info to check if OB2.0 was negotiated
+	var isOB20 bool
+	var connID uint32
+	sqlConn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to establish connection: %w", err)
+	}
+	defer sqlConn.Close()
+
+	err = sqlConn.Raw(func(driverConn any) error {
+		if conn, ok := driverConn.(*oceanbase.Conn); ok {
+			isOB20 = conn.IsOB20()
+			connID = conn.ConnectionID()
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to check raw connection: %w", err)
+	}
+
+	fmt.Println("=== OceanBase Protocol Detection ===")
+	if isOB20 {
+		fmt.Printf("Negotiated Protocol: OceanBase 2.0 (OB20)\n")
+	} else {
+		fmt.Printf("Negotiated Protocol: Standard MySQL Protocol\n")
+	}
+	if connID > 0 {
+		fmt.Printf("Connection ID:       %d\n", connID)
+	}
+	fmt.Println()
+
+	// 2. Perform SQL Checks
+	fmt.Println("=== OceanBase SQL & Tenant Checks ===")
+
+	tenantMode := "Unknown"
+	dbVersion := "Unknown"
+	currentUser := "Unknown"
+
+	// Try checking if we are in Oracle mode
+	var banner string
+	isOracle := false
+	if err := db.QueryRowContext(ctx, "select banner from v$version where rownum = 1").Scan(&banner); err == nil {
+		isOracle = true
+		tenantMode = "Oracle"
+		dbVersion = banner
+	} else {
+		// Try checking via standard MySQL version query
+		var ver string
+		if err := db.QueryRowContext(ctx, "select version()").Scan(&ver); err == nil {
+			isOracle = false
+			tenantMode = "MySQL"
+			dbVersion = ver
+		}
+	}
+
+	// Get current user
+	var userVal string
+	userQuery := "select user from dual"
+	if !isOracle {
+		userQuery = "select user()"
+	}
+	if err := db.QueryRowContext(ctx, userQuery).Scan(&userVal); err == nil {
+		currentUser = userVal
+	}
+
+	fmt.Printf("Tenant Mode:  %s\n", tenantMode)
+	fmt.Printf("Current User: %s\n", currentUser)
+	fmt.Printf("DB Version:   %s\n", dbVersion)
+
+	// Check system table access
+	fmt.Println("\n=== System Catalog / Dictionary Access Check ===")
+	if isOracle {
+		tables := []string{"all_tables", "user_tables", "all_users"}
+		for _, tbl := range tables {
+			var count int
+			q := fmt.Sprintf("select count(*) from %s where rownum <= 1", tbl)
+			if err := db.QueryRowContext(ctx, q).Scan(&count); err == nil {
+				fmt.Printf("Access to %s: SUCCESS\n", tbl)
+			} else {
+				fmt.Printf("Access to %s: FAILED (%v)\n", tbl, err)
+			}
+		}
+	} else {
+		tables := []string{"information_schema.tables", "mysql.user"}
+		for _, tbl := range tables {
+			var count int
+			q := fmt.Sprintf("select count(*) from %s limit 1", tbl)
+			if err := db.QueryRowContext(ctx, q).Scan(&count); err == nil {
+				fmt.Printf("Access to %s: SUCCESS\n", tbl)
+			} else {
+				fmt.Printf("Access to %s: FAILED (%v)\n", tbl, err)
+			}
+		}
+	}
+
+	// Transaction smoke check
+	fmt.Println("\n=== Transaction Support Check ===")
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		fmt.Printf("Transaction Begin: FAILED (%v)\n", err)
+	} else {
+		var val int
+		dualQuery := "select 1 from dual"
+		if !isOracle {
+			dualQuery = "select 1"
+		}
+		if err := tx.QueryRowContext(ctx, dualQuery).Scan(&val); err != nil {
+			fmt.Printf("Transaction Query: FAILED (%v)\n", err)
+			_ = tx.Rollback()
+		} else {
+			if err := tx.Commit(); err != nil {
+				fmt.Printf("Transaction Commit: FAILED (%v)\n", err)
+			} else {
+				fmt.Printf("Transaction Smoke: SUCCESS\n")
+			}
+		}
+	}
+
+	fmt.Println("\nAll checks completed.")
+	return nil
 }

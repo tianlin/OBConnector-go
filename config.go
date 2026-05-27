@@ -33,6 +33,7 @@ type Config struct {
 	ProtocolV2     bool
 	OB20Magic      uint16
 	TLSConfig      *tls.Config
+	UseCompression bool
 }
 
 func ParseDSN(dsn string) (*Config, error) {
@@ -96,9 +97,13 @@ func parseURLDSN(dsn string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Addr:       u.Host,
-		Database:   strings.TrimPrefix(u.EscapedPath(), "/"),
-		Attributes: map[string]string{},
+		Addr:           u.Host,
+		Database:       strings.TrimPrefix(u.EscapedPath(), "/"),
+		Attributes:     map[string]string{},
+		UseCompression: true,
+	}
+	if u.Scheme == "oboracle" {
+		cfg.Preset = "oboracle"
 	}
 	if user := u.User; user != nil {
 		cfg.User = user.Username()
@@ -142,11 +147,15 @@ func parseOpaqueDSN(dsn string) (*Config, error) {
 		return nil, fmt.Errorf("invalid database escape: %w", err)
 	}
 	cfg := &Config{
-		Addr:       addr,
-		User:       user,
-		Password:   password,
-		Database:   database,
-		Attributes: map[string]string{},
+		Addr:           addr,
+		User:           user,
+		Password:       password,
+		Database:       database,
+		Attributes:     map[string]string{},
+		UseCompression: true,
+	}
+	if strings.HasPrefix(dsn, "oboracle:") {
+		cfg.Preset = "oboracle"
 	}
 	if rawQuery != "" {
 		values, err := url.ParseQuery(rawQuery)
@@ -162,7 +171,7 @@ func parseOpaqueDSN(dsn string) (*Config, error) {
 
 func parseLegacyDSN(dsn string) (*Config, error) {
 	// Minimal compatibility with user:pass@tcp(host:port)/db?timeout=5s.
-	cfg := &Config{Addr: defaultAddr, Attributes: map[string]string{}}
+	cfg := &Config{Addr: defaultAddr, Attributes: map[string]string{}, UseCompression: true}
 	before, after, ok := strings.Cut(dsn, "@tcp(")
 	if !ok {
 		return nil, errors.New("dsn must be oceanbase://user:pass@host:port/db or user:pass@tcp(host:port)/db")
@@ -253,6 +262,13 @@ func applyQuery(cfg *Config, values url.Values) error {
 			return fmt.Errorf("invalid ob20.magic: %w", err)
 		}
 		cfg.OB20Magic = uint16(v)
+	}
+	if compress := getQueryValue(values, "useCompression", "compress", "use_compression"); compress != "" {
+		enabled, err := strconv.ParseBool(compress)
+		if err != nil {
+			return fmt.Errorf("invalid compress: %w", err)
+		}
+		cfg.UseCompression = enabled
 	}
 	if tlsVal := getQueryValue(values, "tls"); tlsVal != "" {
 		switch tlsVal {

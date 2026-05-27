@@ -51,3 +51,23 @@ func TestParseURLDSNAttributes(t *testing.T) {
 		t.Fatalf("init sql = %#v", cfg.InitSQL)
 	}
 }
+
+func TestParseObOracleSchemeAutoPreset(t *testing.T) {
+	// Test URL scheme
+	cfg, err := ParseDSN("oboracle://u:p@127.0.0.1:2883/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Preset != "oboracle" {
+		t.Fatalf("expected preset 'oboracle', got %q", cfg.Preset)
+	}
+
+	// Test Opaque scheme
+	cfg2, err := ParseDSN("oboracle:u:p@127.0.0.1:2883/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.Preset != "oboracle" {
+		t.Fatalf("expected preset 'oboracle', got %q", cfg2.Preset)
+	}
+}

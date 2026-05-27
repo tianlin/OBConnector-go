@@ -66,6 +66,7 @@ func obConnectorCAttributes() map[string]string {
 		"__mysql_client_type":                   "__ob_libobclient",
 		"__ob_client_name":                      "OceanBase Connector/C",
 		"__ob_client_version":                   Version,
+		"ob_capability_flag":                    formatUint64(proxyCaps),
 		"__proxy_capability_flag":               formatUint64(proxyCaps),
 		"__ob_client_attribute_capability_flag": formatUint64(attrCaps),
 	}

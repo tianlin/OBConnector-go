@@ -4,6 +4,8 @@ bin/
 coverage.out
 coverage.html
 *.test
+obping
+obping-*
 
 # Local environment and secrets
 .env

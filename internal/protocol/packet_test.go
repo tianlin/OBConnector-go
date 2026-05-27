@@ -2,8 +2,11 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
+	"net"
 	"testing"
+	"time"
 )
 
 type mockRW struct {
@@ -283,5 +286,177 @@ func TestPacketIdentity(t *testing.T) {
 			t.Fatalf("payload %d: length mismatch: got %d, want %d", idx, len(data), len(payload))
 			t.Fatalf("payload %d: got %v, want %v", idx, data, payload)
 		}
+	}
+}
+
+func TestOB20MultiPacket(t *testing.T) {
+	mock := newMockRW()
+	pc := NewPacketConn(mock)
+	pc.EnableOB20(1, OB20MagicNum)
+	pc.NextRequest()
+
+	mysqlPackets := []byte{}
+	mysqlPackets = append(mysqlPackets, 5, 0, 0, 0, 'h', 'e', 'l', 'l', 'o')
+	mysqlPackets = append(mysqlPackets, 5, 0, 0, 1, 'w', 'o', 'r', 'l', 'd')
+	mysqlPackets = append(mysqlPackets, 5, 0, 0, 2, 'o', 'c', 'e', 'a', 'n')
+
+	payloadLen := uint32(len(mysqlPackets))
+	compressLength := uint32(TotalHeaderLen - CompressHeaderLen + len(mysqlPackets) + OB20TailLen)
+
+	h := OB20Header{
+		CompressLength:   compressLength,
+		CompressSeqNo:    0,
+		UncompressLength: 0,
+		MagicNum:         OB20MagicNum,
+		Version:          OB20Version,
+		ConnectionID:     1,
+		RequestID:        pc.requestID,
+		PacketSeq:        0,
+		PayloadLen:       payloadLen,
+		Flag:             OB20FlagLast | OB20FlagNewExtraInfo,
+		Reserved:         0,
+	}
+
+	var obHeaderBuf [TotalHeaderLen]byte
+	h.Encode(obHeaderBuf[:])
+
+	tail := OB20PayloadChecksum(mysqlPackets)
+	var obTrailer [4]byte
+	binary.LittleEndian.PutUint32(obTrailer[:], tail)
+
+	mock.Write(obHeaderBuf[:])
+	mock.Write(mysqlPackets)
+	mock.Write(obTrailer[:])
+
+	p1, err := pc.ReadPacket()
+	if err != nil {
+		t.Fatalf("first read error: %v", err)
+	}
+	if string(p1) != "hello" {
+		t.Errorf("got %q, want %q", string(p1), "hello")
+	}
+
+	p2, err := pc.ReadPacket()
+	if err != nil {
+		t.Fatalf("second read error: %v", err)
+	}
+	if string(p2) != "world" {
+		t.Errorf("got %q, want %q", string(p2), "world")
+	}
+
+	p3, err := pc.ReadPacket()
+	if err != nil {
+		t.Fatalf("third read error: %v", err)
+	}
+	if string(p3) != "ocean" {
+		t.Errorf("got %q, want %q", string(p3), "ocean")
+	}
+}
+
+func TestOB20SplitPacket(t *testing.T) {
+	mock := newMockRW()
+	pc := NewPacketConn(mock)
+	pc.EnableOB20(1, OB20MagicNum)
+	pc.NextRequest()
+
+	p1 := []byte{11, 0, 0, 0, 'h', 'e', 'l', 'l'}
+	h1 := OB20Header{
+		CompressLength: uint32(TotalHeaderLen - CompressHeaderLen + len(p1) + OB20TailLen),
+		MagicNum:       OB20MagicNum,
+		Version:        OB20Version,
+		ConnectionID:   1,
+		RequestID:      pc.requestID,
+		PayloadLen:     uint32(len(p1)),
+		Flag:           OB20FlagNewExtraInfo,
+	}
+	var header1 [TotalHeaderLen]byte
+	h1.Encode(header1[:])
+	tail1 := OB20PayloadChecksum(p1)
+	var trailer1 [4]byte
+	binary.LittleEndian.PutUint32(trailer1[:], tail1)
+
+	mock.Write(header1[:])
+	mock.Write(p1)
+	mock.Write(trailer1[:])
+
+	p2 := []byte{'o', ' ', 'w', 'o', 'r', 'l', 'd'}
+	h2 := OB20Header{
+		CompressLength: uint32(TotalHeaderLen - CompressHeaderLen + len(p2) + OB20TailLen),
+		MagicNum:       OB20MagicNum,
+		Version:        OB20Version,
+		ConnectionID:   1,
+		RequestID:      pc.requestID,
+		PayloadLen:     uint32(len(p2)),
+		Flag:           OB20FlagLast | OB20FlagNewExtraInfo,
+	}
+	var header2 [TotalHeaderLen]byte
+	h2.Encode(header2[:])
+	tail2 := OB20PayloadChecksum(p2)
+	var trailer2 [4]byte
+	binary.LittleEndian.PutUint32(trailer2[:], tail2)
+
+	mock.Write(header2[:])
+	mock.Write(p2)
+	mock.Write(trailer2[:])
+
+	data, err := pc.ReadPacket()
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Errorf("got %q, want %q", string(data), "hello world")
+	}
+}
+
+func TestOB20FragmentedArrivalResumesWhenComplete(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	pc := NewPacketConn(client)
+	pc.EnableOB20(1, OB20MagicNum)
+	pc.NextRequest()
+
+	mysqlPayload := []byte{5, 0, 0, 0, 'h', 'e', 'l', 'l', 'o'}
+	payloadLen := uint32(len(mysqlPayload))
+	compressLength := uint32(TotalHeaderLen - CompressHeaderLen + len(mysqlPayload) + OB20TailLen)
+
+	h := OB20Header{
+		CompressLength:   compressLength,
+		CompressSeqNo:    0,
+		UncompressLength: 0,
+		MagicNum:         OB20MagicNum,
+		Version:          OB20Version,
+		ConnectionID:     1,
+		RequestID:        pc.requestID,
+		PacketSeq:        0,
+		PayloadLen:       payloadLen,
+		Flag:             OB20FlagLast | OB20FlagNewExtraInfo,
+		Reserved:         0,
+	}
+
+	var obHeaderBuf [TotalHeaderLen]byte
+	h.Encode(obHeaderBuf[:])
+	tail := OB20PayloadChecksum(mysqlPayload)
+	var obTrailer [4]byte
+	binary.LittleEndian.PutUint32(obTrailer[:], tail)
+
+	go func() {
+		server.Write(obHeaderBuf[:15])
+		time.Sleep(10 * time.Millisecond)
+
+		server.Write(obHeaderBuf[15:])
+		server.Write(mysqlPayload)
+		time.Sleep(10 * time.Millisecond)
+
+		server.Write(obTrailer[:])
+	}()
+
+	data, err := pc.ReadPacket()
+	if err != nil {
+		t.Fatalf("ReadPacket error: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("got %q, want %q", string(data), "hello")
 	}
 }
