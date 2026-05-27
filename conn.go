@@ -62,6 +62,9 @@ func dialAndHandshake(ctx context.Context, cfg *Config) (*Conn, error) {
 		packets: protocol.NewPacketConn(netConn),
 		cfg:     cfg,
 	}
+	if cfg.Trace && cfg.TraceWriter != nil {
+		c.packets.SetTraceWriter(cfg.TraceWriter)
+	}
 	if err := c.withDeadline(ctx, func() error { return c.handshake() }); err != nil {
 		_ = netConn.Close()
 		return nil, err

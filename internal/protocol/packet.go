@@ -2,9 +2,11 @@ package protocol
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -56,10 +58,15 @@ type PacketConn struct {
 	extraInfos      []OB20ExtraInfo
 	mysqlBuf        []byte
 	ob20NewExtraInfo bool
+	traceWriter     io.Writer
 }
 
 func NewPacketConn(rw io.ReadWriter) *PacketConn {
 	return &PacketConn{rw: rw}
+}
+
+func (c *PacketConn) SetTraceWriter(w io.Writer) {
+	c.traceWriter = w
 }
 
 func (c *PacketConn) ResetSequence() {
@@ -107,12 +114,18 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 			// Step B: read one OB20 frame from c.rw
 			var obHeader [TotalHeaderLen]byte
 			if _, err := io.ReadFull(c.rw, obHeader[:]); err != nil {
+				c.dumpRawRX("read OB20 header failed", obHeader[:], err)
 				return nil, err
 			}
 			var h OB20Header
 			if !h.Decode(obHeader[:]) {
+				c.dumpRawRX("decode OB20 header failed", obHeader[:], nil)
 				return nil, fmt.Errorf("invalid OB 2.0 header")
 			}
+
+			c.traceOB20RX("OB20 frame: magic=0x%04x version=%d connID=%d reqID=%d seq=%d payload=%d flags=%s",
+				h.MagicNum, h.Version, h.ConnectionID, h.RequestID,
+				h.PacketSeq, h.PayloadLen, ob20FlagNames(h.Flag))
 
 			obPayload := make([]byte, h.PayloadLen)
 			if _, err := io.ReadFull(c.rw, obPayload); err != nil {
@@ -324,4 +337,43 @@ func (c *PacketConn) IsOB20() bool {
 
 func (c *PacketConn) ConnectionID() uint32 {
 	return c.connectionID
+}
+
+func (c *PacketConn) traceOB20RX(format string, args ...any) {
+	if c.traceWriter == nil {
+		return
+	}
+	fmt.Fprintf(c.traceWriter, "obconnector-go: rx: "+format+"\n", args...)
+}
+
+func (c *PacketConn) dumpRawRX(reason string, peek []byte, err error) {
+	if c.traceWriter == nil {
+		return
+	}
+	n := len(peek)
+	if n > 64 {
+		n = 64
+	}
+	fmt.Fprintf(c.traceWriter, "obconnector-go: rx: %s err=%v first=%d bytes: %s\n",
+		reason, err, len(peek), hex.EncodeToString(peek[:n]))
+}
+
+func ob20FlagNames(flag uint32) string {
+	parts := []string{}
+	if flag&OB20FlagExtraInfo != 0 {
+		parts = append(parts, "EXTRA_INFO")
+	}
+	if flag&OB20FlagLast != 0 {
+		parts = append(parts, "LAST")
+	}
+	if flag&OB20FlagProxyReroute != 0 {
+		parts = append(parts, "PROXY_REROUTE")
+	}
+	if flag&OB20FlagNewExtraInfo != 0 {
+		parts = append(parts, "NEW_EXTRA_INFO")
+	}
+	if len(parts) == 0 {
+		return "NONE"
+	}
+	return strings.Join(parts, "|")
 }
