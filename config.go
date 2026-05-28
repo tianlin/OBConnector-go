@@ -17,25 +17,25 @@ import (
 const defaultAddr = "127.0.0.1:2881"
 
 type Config struct {
-	Addrs          []string
-	Addr           string
-	User           string
-	Password       string
-	Database       string
-	Timeout        time.Duration
-	Attributes     map[string]string
-	CapabilityAdd  uint32
-	CapabilityDrop uint32
-	Collation      byte
-	InitSQL        []string
-	Preset         string
-	Trace          bool
-	TraceWriter    io.Writer
-	ProtocolV2         bool
-	OB20Magic          uint16
+	Addrs               []string
+	Addr                string
+	User                string
+	Password            string
+	Database            string
+	Timeout             time.Duration
+	Attributes          map[string]string
+	CapabilityAdd       uint32
+	CapabilityDrop      uint32
+	Collation           byte
+	InitSQL             []string
+	Preset              string
+	Trace               bool
+	TraceWriter         io.Writer
+	ProtocolV2          bool
+	OB20Magic           uint16
 	DisableOB20Checksum bool
-	TLSConfig      *tls.Config
-	UseCompression bool
+	TLSConfig           *tls.Config
+	UseCompression      bool
 }
 
 func ParseDSN(dsn string) (*Config, error) {

@@ -1049,21 +1049,21 @@ func appendRawQuery(dsn string, values url.Values) string {
 
 func resolveCharset(name string) string {
 	charsetMap := map[string]string{
-		"big5":     "1",
-		"latin1":   "5",
-		"ascii":    "11",
-		"gbk":      "28",
-		"utf8":     "33",
-		"utf8mb4":  "45",
-		"binary":   "63",
-		"latin2":   "2",
-		"gb2312":   "24",
-		"gb18030":  "248",
-		"euckr":    "19",
-		"sjis":     "13",
-		"ujis":     "12",
-		"utf16":    "54",
-		"utf32":    "60",
+		"big5":    "1",
+		"latin1":  "5",
+		"ascii":   "11",
+		"gbk":     "28",
+		"utf8":    "33",
+		"utf8mb4": "45",
+		"binary":  "63",
+		"latin2":  "2",
+		"gb2312":  "24",
+		"gb18030": "248",
+		"euckr":   "19",
+		"sjis":    "13",
+		"ujis":    "12",
+		"utf16":   "54",
+		"utf32":   "60",
 	}
 	if id, ok := charsetMap[strings.ToLower(name)]; ok {
 		return id
