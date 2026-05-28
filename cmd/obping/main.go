@@ -46,10 +46,19 @@ func main() {
 		poolTest  = flag.Bool("pool-test", false, "run database/sql pool lifecycle smoke tests")
 		bulkTest  = flag.Bool("bulk-test", false, "run BulkInsert smoke test")
 		fullTest  = flag.Bool("full-test", false, "run comprehensive integration tests (all of the above)")
-		oraMode   = flag.Bool("oracle-mode", false, "force Oracle mode (equivalent to oracleMode=true in DSN)")
-		mysqlMode = flag.Bool("mysql-mode", false, "force MySQL mode (equivalent to oracleMode=false in DSN)")
+		oraMode   = flag.Bool("oracle-mode", false, "force Oracle mode (equivalent to preset=oboracle)")
+		mysqlMode = flag.Bool("mysql-mode", false, "force MySQL mode (equivalent to oracleMode=false)")
 		tlsFlag   = flag.Bool("tls", false, "enable TLS")
 		tlsCAFlag = flag.String("tls-ca", "", "path to CA certificate for TLS")
+		tlsCert   = flag.String("tls-cert", "", "path to client certificate for mutual TLS")
+		tlsKey    = flag.String("tls-key", "", "path to client private key for mutual TLS")
+		compress  = flag.Bool("compress", false, "enable compression")
+		charset   = flag.String("charset", "", "character set name (e.g. GBK, UTF8, UTF8MB4)")
+		ob20Magic = flag.String("ob20-magic", "", "OB20 magic number (uint16, e.g. 0xCAFE)")
+		addrs     = flag.String("addrs", "", "comma-separated list of host:port for multi-address failover")
+		traceID   = flag.String("trace-id", "", "full-link trace ID")
+		spanID    = flag.String("span-id", "", "full-link trace span ID")
+		partID    = flag.String("partition-id", "", "full-link trace partition ID")
 		check     = flag.Bool("check", false, "run protocol detection and SQL checks")
 	)
 	flag.Var(&attrs, "attr", "connection attribute key=value; can be repeated")
@@ -62,18 +71,18 @@ func main() {
 			fmt.Fprintln(os.Stderr, "missing -user or -dsn")
 			os.Exit(2)
 		}
-		connString = buildDSN(*user, *pass, *host, *port, *dbName, *timeout, *trace, *capAdd, *capDrop, *collation, *preset, *ob20, *oraMode, attrs, initSQL)
+		connString = buildDSN(*user, *pass, *host, *port, *dbName, *timeout, *trace, *capAdd, *capDrop, *collation, *preset, *ob20, *oraMode, *compress, *charset, *ob20Magic, *addrs, attrs, initSQL)
 	} else {
 		var err error
-		connString, err = applyExperimentParams(connString, *trace, *capAdd, *capDrop, *collation, *preset, *ob20, *oraMode, attrs, initSQL)
+		connString, err = applyExperimentParams(connString, *trace, *capAdd, *capDrop, *collation, *preset, *ob20, *oraMode, *compress, *charset, *ob20Magic, *addrs, attrs, initSQL)
 		if err != nil {
 			exitErr(err)
 		}
 	}
 
-	// Apply TLS and MySQL mode flags (applied to any DSN format)
+	// Apply TLS, MySQL mode, client cert, and full-link trace flags (applied to any DSN format)
 	var extraParams url.Values
-	if *tlsFlag || *tlsCAFlag != "" || *mysqlMode {
+	if *tlsFlag || *tlsCAFlag != "" || *tlsCert != "" || *tlsKey != "" || *mysqlMode || *traceID != "" || *spanID != "" || *partID != "" {
 		extraParams = url.Values{}
 	}
 	if *tlsFlag {
@@ -82,8 +91,23 @@ func main() {
 	if *tlsCAFlag != "" {
 		extraParams.Set("tls.ca", *tlsCAFlag)
 	}
+	if *tlsCert != "" {
+		extraParams.Set("tls.cert", *tlsCert)
+	}
+	if *tlsKey != "" {
+		extraParams.Set("tls.key", *tlsKey)
+	}
 	if *mysqlMode {
 		extraParams.Set("oracleMode", "false")
+	}
+	if *traceID != "" {
+		extraParams.Set("attr._ob_trace_id", *traceID)
+	}
+	if *spanID != "" {
+		extraParams.Set("attr._ob_span_id", *spanID)
+	}
+	if *partID != "" {
+		extraParams.Set("attr._ob_partition_id", *partID)
 	}
 	if extraParams != nil {
 		connString = appendRawQuery(connString, extraParams)
@@ -187,7 +211,7 @@ func probePresets(ctx context.Context, baseDSN string) error {
 	presets := []string{"default", "oboracle", "obclient", "libobclient", "connector-c", "connector-j"}
 	var lastErr error
 	for _, preset := range presets {
-		dsn, err := applyExperimentParams(baseDSN, false, "", "", "", preset, false, false, nil, nil)
+		dsn, err := applyExperimentParams(baseDSN, false, "", "", "", preset, false, false, false, "", "", "", nil, nil)
 		if err != nil {
 			return err
 		}
@@ -918,21 +942,25 @@ func (f *repeatedFlag) Set(value string) error {
 	return nil
 }
 
-func buildDSN(user, password, host, port, database string, timeout time.Duration, trace bool, capAdd, capDrop, collation, preset string, ob20 bool, oracleMode bool, attrs, initSQL []string) string {
+func buildDSN(user, password, host, port, database string, timeout time.Duration, trace bool, capAdd, capDrop, collation, preset string, ob20, oracleMode, compress bool, charset, ob20Magic, addrs string, attrs, initSQL []string) string {
+	hostPart := net.JoinHostPort(host, port)
+	if addrs != "" {
+		hostPart = addrs
+	}
 	u := &url.URL{
 		Scheme: "oceanbase",
 		User:   url.UserPassword(user, password),
-		Host:   net.JoinHostPort(host, port),
+		Host:   hostPart,
 		Path:   database,
 	}
-	values, _ := experimentValues(trace, capAdd, capDrop, collation, preset, ob20, oracleMode, attrs, initSQL)
+	values, _ := experimentValues(trace, capAdd, capDrop, collation, preset, ob20, oracleMode, compress, charset, ob20Magic, attrs, initSQL)
 	values.Set("timeout", timeout.String())
 	u.RawQuery = values.Encode()
 	return u.String()
 }
 
-func applyExperimentParams(dsn string, trace bool, capAdd, capDrop, collation, preset string, ob20 bool, oracleMode bool, attrs, initSQL []string) (string, error) {
-	values, changed := experimentValues(trace, capAdd, capDrop, collation, preset, ob20, oracleMode, attrs, initSQL)
+func applyExperimentParams(dsn string, trace bool, capAdd, capDrop, collation, preset string, ob20, oracleMode, compress bool, charset, ob20Magic, addrs string, attrs, initSQL []string) (string, error) {
+	values, changed := experimentValues(trace, capAdd, capDrop, collation, preset, ob20, oracleMode, compress, charset, ob20Magic, attrs, initSQL)
 	if !strings.Contains(dsn, "://") {
 		if strings.HasPrefix(dsn, "oceanbase:") || strings.HasPrefix(dsn, "oboracle:") {
 			if !changed {
@@ -960,10 +988,10 @@ func applyExperimentParams(dsn string, trace bool, capAdd, capDrop, collation, p
 	return u.String(), nil
 }
 
-func experimentValues(trace bool, capAdd, capDrop, collation, preset string, ob20 bool, oracleMode bool, attrs, initSQL []string) (url.Values, bool) {
+func experimentValues(trace bool, capAdd, capDrop, collation, preset string, ob20, oracleMode, compress bool, charset, ob20Magic string, attrs, initSQL []string) (url.Values, bool) {
 	values := url.Values{}
 	if oracleMode {
-		values.Set("oracleMode", "true")
+		values.Set("preset", "oboracle")
 	}
 	if trace {
 		values.Set("trace", "true")
@@ -982,6 +1010,20 @@ func experimentValues(trace bool, capAdd, capDrop, collation, preset string, ob2
 	}
 	if preset != "" {
 		values.Set("preset", preset)
+	}
+	if compress {
+		values.Set("compress", "true")
+	}
+	if charset != "" {
+		charsetID := resolveCharset(charset)
+		if charsetID != "" {
+			values.Set("collation", charsetID)
+		} else {
+			values.Set("collation", charset)
+		}
+	}
+	if ob20Magic != "" {
+		values.Set("ob20.magic", ob20Magic)
 	}
 	for _, attr := range attrs {
 		key, value, ok := strings.Cut(attr, "=")
@@ -1003,6 +1045,30 @@ func appendRawQuery(dsn string, values url.Values) string {
 		sep = "&"
 	}
 	return dsn + sep + values.Encode()
+}
+
+func resolveCharset(name string) string {
+	charsetMap := map[string]string{
+		"big5":     "1",
+		"latin1":   "5",
+		"ascii":    "11",
+		"gbk":      "28",
+		"utf8":     "33",
+		"utf8mb4":  "45",
+		"binary":   "63",
+		"latin2":   "2",
+		"gb2312":   "24",
+		"gb18030":  "248",
+		"euckr":    "19",
+		"sjis":     "13",
+		"ujis":     "12",
+		"utf16":    "54",
+		"utf32":    "60",
+	}
+	if id, ok := charsetMap[strings.ToLower(name)]; ok {
+		return id
+	}
+	return ""
 }
 
 func exitErr(err error) {

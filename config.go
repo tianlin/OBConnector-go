@@ -341,6 +341,20 @@ func applyQuery(cfg *Config, values url.Values) error {
 		}
 		cfg.TLSConfig.RootCAs = rootPool
 	}
+	if tlsCert := getQueryValue(values, "tls.cert", "tls_cert"); tlsCert != "" {
+		tlsKey := getQueryValue(values, "tls.key", "tls_key")
+		if tlsKey == "" {
+			return errors.New("tls.cert requires tls.key")
+		}
+		cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+		if err != nil {
+			return fmt.Errorf("invalid tls.cert/tls.key: %w", err)
+		}
+		if cfg.TLSConfig == nil {
+			cfg.TLSConfig = &tls.Config{}
+		}
+		cfg.TLSConfig.Certificates = append(cfg.TLSConfig.Certificates, cert)
+	}
 	cfg.InitSQL = append(cfg.InitSQL, values["init"]...)
 	for key, vals := range values {
 		if strings.HasPrefix(key, "attr.") && len(vals) > 0 {
