@@ -64,11 +64,11 @@ func obConnectorCAttributes() map[string]string {
 	attrCaps := obClientCapOBLOBLocatorV2 | obClientCapSupportJDBCBinaryDouble
 
 	return map[string]string{
-		"_client_name":                          "OceanBase JDBC Driver",
-		"_client_version":                       "2.2.10",
-		"__mysql_client_type":                   "__ob_jdbc_client",
-		"__ob_client_name":                      "OceanBase JDBC Driver",
-		"__ob_client_version":                   "2.2.10",
+		"_client_name":                          "OceanBase Connector/Go",
+		"_client_version":                       Version,
+		"__mysql_client_type":                   "__ob_go_client",
+		"__ob_client_name":                      "OceanBase Connector/Go",
+		"__ob_client_version":                   Version,
 		"ob_capability_flag":                    formatUint64(proxyCaps),
 		"__proxy_capability_flag":               formatUint64(proxyCaps),
 		"__ob_client_attribute_capability_flag": formatUint64(attrCaps),

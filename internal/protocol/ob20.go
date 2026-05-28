@@ -74,7 +74,7 @@ func (h *OB20Header) Encode(buf []byte) {
 	binary.LittleEndian.PutUint16(buf[29:31], h.HeaderCRC)
 }
 
-// Decode deserializes the header from buf and verifies CRC16-IBM.
+// Decode deserializes the header from buf and verifies CRC16-IBM, magic number, and version.
 func (h *OB20Header) Decode(buf []byte) bool {
 	if len(buf) < TotalHeaderLen {
 		return false
@@ -85,6 +85,9 @@ func (h *OB20Header) Decode(buf []byte) bool {
 
 	h.MagicNum = binary.LittleEndian.Uint16(buf[7:9])
 	h.Version = binary.LittleEndian.Uint16(buf[9:11])
+	if h.MagicNum != OB20MagicNum || h.Version != OB20Version {
+		return false
+	}
 	h.ConnectionID = binary.LittleEndian.Uint32(buf[11:15])
 	h.RequestID = uint32(buf[15]) | uint32(buf[16])<<8 | uint32(buf[17])<<16
 	h.PacketSeq = buf[18]

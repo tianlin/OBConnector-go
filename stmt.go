@@ -96,10 +96,5 @@ func (s *Stmt) Reset(ctx context.Context) error {
 	if s.closed {
 		return errors.New("oceanbase: statement is closed")
 	}
-	s.conn.mu.Lock()
-	defer s.conn.mu.Unlock()
-	if err := s.conn.checkUsableLocked(); err != nil {
-		return err
-	}
 	return s.conn.resetStmt(s.stmtID)
 }

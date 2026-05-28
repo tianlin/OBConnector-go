@@ -37,6 +37,9 @@ func interpolateParams(query string, args []driver.NamedValue) (string, error) {
 			case '`':
 				state = sqlBacktick
 				out.WriteByte(ch)
+			case '#':
+				state = sqlLineComment
+				out.WriteByte(ch)
 			case '-':
 				if i+1 < len(query) && query[i+1] == '-' {
 					state = sqlLineComment
@@ -120,6 +123,8 @@ func countPlaceholders(query string) int {
 				state = sqlDoubleQuote
 			case '`':
 				state = sqlBacktick
+			case '#':
+				state = sqlLineComment
 			case '-':
 				if i+1 < len(query) && query[i+1] == '-' {
 					i++

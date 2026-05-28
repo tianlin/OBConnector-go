@@ -386,44 +386,73 @@ func (c *Conn) handshake() error {
 }
 
 func (c *Conn) handleAuthResult(hs *handshake) error {
-	authResult, err := c.packets.ReadPacket()
-	if err != nil {
-		return err
-	}
-	if len(authResult) == 0 {
-		return io.ErrUnexpectedEOF
-	}
-
-	switch authResult[0] {
-	case protocol.OKPacket:
-		c.tracef("auth result: OK")
-		if _, _, err := c.handleOK(authResult); err != nil {
+	const maxAuthRounds = 10
+	for round := 0; round < maxAuthRounds; round++ {
+		authResult, err := c.packets.ReadPacket()
+		if err != nil {
 			return err
 		}
-		if c.cfg.ProtocolV2 && !c.ob20Declined {
-			magic := protocol.OB20MagicNum
-			if c.cfg.OB20Magic != 0 {
-				magic = c.cfg.OB20Magic
+		if len(authResult) == 0 {
+			return io.ErrUnexpectedEOF
+		}
+
+		switch authResult[0] {
+		case protocol.OKPacket:
+			c.tracef("auth result: OK")
+			if _, _, err := c.handleOK(authResult); err != nil {
+				return err
 			}
-			c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x, NewExtraInfo: true)", hs.connectionID, magic)
-			c.packets.EnableOB20(hs.connectionID, magic, true)
-		}
-		envOverride := os.Getenv("OB_USE_COMPRESSION")
-		negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)
-		if negotiatedCompress {
-			c.packets.EnableCompression()
-		}
-		return nil
-	case protocol.ErrPacket:
-		c.tracef("auth result: ERR")
-		return parseServerError(authResult)
-	case 0x01:
-		if len(authResult) < 2 {
-			return fmt.Errorf("oceanbase: unexpected auth response 0x01 (too short)")
-		}
-		switch authResult[1] {
-		case 0x03:
-			c.tracef("auth result: auth-switch request (0x01 0x03)")
+			if c.cfg.ProtocolV2 && c.ob20Confirmed {
+				magic := protocol.OB20MagicNum
+				if c.cfg.OB20Magic != 0 {
+					magic = c.cfg.OB20Magic
+				}
+				c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x, NewExtraInfo: true)", hs.connectionID, magic)
+				c.packets.EnableOB20(hs.connectionID, magic, true)
+			}
+			envOverride := os.Getenv("OB_USE_COMPRESSION")
+			negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)
+			if negotiatedCompress {
+				c.packets.EnableCompression()
+			}
+			return nil
+		case protocol.ErrPacket:
+			c.tracef("auth result: ERR")
+			return parseServerError(authResult)
+		case 0x01:
+			if len(authResult) < 2 {
+				return fmt.Errorf("oceanbase: unexpected auth response 0x01 (too short)")
+			}
+			switch authResult[1] {
+			case 0x03:
+				c.tracef("auth result: auth-switch request (0x01 0x03)")
+				plugin, seed, err := c.readAuthSwitchData()
+				if err != nil {
+					return err
+				}
+				hs.authPlugin = plugin
+				hs.authSeed = seed
+				authResp, err := buildAuthResponse(hs.authPlugin, c.cfg.Password, hs.authSeed)
+				if err != nil {
+					return err
+				}
+				if err := c.packets.WritePacket(authResp); err != nil {
+					return err
+				}
+			case 0x04:
+				c.tracef("auth result: caching_sha2_password full-auth required")
+				if c.cfg.TLSConfig != nil {
+					if err := c.packets.WritePacket([]byte(c.cfg.Password)); err != nil {
+						return err
+					}
+				} else {
+					return fmt.Errorf("oceanbase: caching_sha2_password full-auth requires TLS")
+				}
+			default:
+				return fmt.Errorf("oceanbase: unexpected auth sub-response 0x01 0x%02x", authResult[1])
+			}
+		case 0xFE:
+			c.tracef("auth result: classic auth-switch request (0xFE)")
 			plugin, seed, err := c.readAuthSwitchData()
 			if err != nil {
 				return err
@@ -437,38 +466,11 @@ func (c *Conn) handleAuthResult(hs *handshake) error {
 			if err := c.packets.WritePacket(authResp); err != nil {
 				return err
 			}
-			return c.handleAuthResult(hs)
-		case 0x04:
-			c.tracef("auth result: caching_sha2_password full-auth required")
-			if c.cfg.TLSConfig != nil {
-				if err := c.packets.WritePacket([]byte(c.cfg.Password)); err != nil {
-					return err
-				}
-				return c.handleAuthResult(hs)
-			}
-			return fmt.Errorf("oceanbase: caching_sha2_password full-auth requires TLS")
 		default:
-			return fmt.Errorf("oceanbase: unexpected auth sub-response 0x01 0x%02x", authResult[1])
+			return fmt.Errorf("oceanbase: unexpected auth response 0x%02x", authResult[0])
 		}
-	case 0xFE:
-		c.tracef("auth result: classic auth-switch request (0xFE)")
-		plugin, seed, err := c.readAuthSwitchData()
-		if err != nil {
-			return err
-		}
-		hs.authPlugin = plugin
-		hs.authSeed = seed
-		authResp, err := buildAuthResponse(hs.authPlugin, c.cfg.Password, hs.authSeed)
-		if err != nil {
-			return err
-		}
-		if err := c.packets.WritePacket(authResp); err != nil {
-			return err
-		}
-		return c.handleAuthResult(hs)
-	default:
-		return fmt.Errorf("oceanbase: unexpected auth response 0x%02x", authResult[0])
 	}
+	return fmt.Errorf("oceanbase: exceeded maximum authentication rounds (%d)", maxAuthRounds)
 }
 
 func (c *Conn) readAuthSwitchData() (string, []byte, error) {
@@ -602,7 +604,10 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 		attrPayload := make([]byte, 0, 128)
 		for _, kv := range attrs {
 			c.tracef("client attr: %s=%q", kv[0], kv[1])
-			attrPayload = protocol.PutLengthEncodedString(attrPayload, kv[0])
+			// OceanBase attribute key: 1-byte length prefix (aligned with Java/Rust).
+			// Attribute value: full lenenc encoding.
+			attrPayload = append(attrPayload, byte(len(kv[0])))
+			attrPayload = append(attrPayload, kv[0]...)
 			attrPayload = protocol.PutLengthEncodedString(attrPayload, kv[1])
 		}
 		out = protocol.PutLengthEncodedInt(out, uint64(len(attrPayload)))
@@ -613,7 +618,7 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 
 func (c *Conn) connectionAttributes(hs *handshake) [][2]string {
 	attrMap := map[string]string{
-		"_client_name":      "OceanBase JDBC Driver",
+		"_client_name":      "OceanBase Connector/Go",
 		"_client_version":   "2.2.10",
 		"_os":               runtime.GOOS,
 		"_platform":         runtime.GOARCH,
@@ -1033,19 +1038,23 @@ func (c *Conn) withDeadline(ctx context.Context, fn func() error) error {
 		defer c.netConn.SetDeadline(time.Time{})
 	}
 
+	var done atomic.Bool
 	cancelled := make(chan struct{})
 	if ctx.Done() != nil {
 		defer close(cancelled)
 		go func() {
 			select {
 			case <-ctx.Done():
-				_ = c.netConn.SetDeadline(time.Now())
+				if !done.Load() {
+					_ = c.netConn.SetDeadline(time.Now())
+				}
 			case <-cancelled:
 			}
 		}()
 	}
 
 	err := fn()
+	done.Store(true)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			c.bad.Store(true)
@@ -1062,6 +1071,11 @@ func (c *Conn) TenantMode() string {
 }
 
 func (c *Conn) resetStmt(stmtID uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.checkUsableLocked(); err != nil {
+		return err
+	}
 	c.packets.ResetSequence()
 	c.packets.NextRequest()
 	payload := make([]byte, 5)
@@ -1168,6 +1182,7 @@ func (r result) LastInsertId() (int64, error) { return r.lastInsertID, nil }
 func (r result) RowsAffected() (int64, error) { return r.affectedRows, nil }
 
 func (c *Conn) handleOK(packet []byte) (res driver.Result, status uint16, err error) {
+	c.tracef("handleOK packet hex: %x", packet)
 	if len(packet) == 0 || packet[0] != protocol.OKPacket {
 		return nil, 0, fmt.Errorf("not an OK packet")
 	}
@@ -1186,10 +1201,25 @@ func (c *Conn) handleOK(packet []byte) (res driver.Result, status uint16, err er
 	if pos < len(packet) {
 		status = binary.LittleEndian.Uint16(packet[pos : pos+2])
 		pos += 2
+		pos += 2 // skip warnings
 		if status&protocol.ServerSessionStateChanged != 0 {
+			// Skip the human-readable info string before session state data.
+			// MySQL protocol: after warnings comes a lenenc-string "info",
+			// then the lenenc-string session_state (only if SESSION_STATE_CHANGED).
 			if pos < len(packet) {
-				if err := c.handleStateChange(packet[pos:]); err != nil {
-					c.tracef("failed to parse state change: %v", err)
+				_, used, _, err := protocol.ReadLengthEncodedString(packet[pos:])
+				if err == nil {
+					pos += used
+				}
+			}
+			if pos < len(packet) {
+				// Read the session_state_changes lenenc-string wrapper.
+				// The outer lenenc-string contains: type(1) + lenenc(value) + ...
+				trackData, _, _, err := protocol.ReadLengthEncodedString(packet[pos:])
+				if err == nil {
+					if err := c.handleStateChange(trackData); err != nil {
+						c.tracef("failed to parse state change: %v", err)
+					}
 				}
 			}
 			c.tracef("session state changed (status=0x%04x)", status)
@@ -1200,16 +1230,12 @@ func (c *Conn) handleOK(packet []byte) (res driver.Result, status uint16, err er
 }
 
 func (c *Conn) handleStateChange(data []byte) error {
-	raw, _, _, err := protocol.ReadLengthEncodedString(data)
-	if err != nil {
-		return err
-	}
-
+	c.tracef("handleStateChange data hex: %x", data)
 	pos := 0
-	for pos < len(raw) {
-		typ := raw[pos]
+	for pos < len(data) {
+		typ := data[pos]
 		pos++
-		val, used, _, err := protocol.ReadLengthEncodedString(raw[pos:])
+		val, used, _, err := protocol.ReadLengthEncodedString(data[pos:])
 		if err != nil {
 			return err
 		}
@@ -1219,27 +1245,39 @@ func (c *Conn) handleStateChange(data []byte) error {
 		case 0x00, 0x26:
 			pos2 := 0
 			for pos2 < len(val) {
-				k, u, _, err := protocol.ReadLengthEncodedString(val[pos2:])
+				varLen, used, _, err := protocol.ReadLengthEncodedInt(val[pos2:])
 				if err != nil {
 					break
 				}
-				pos2 += u
-				v, u2, _, err := protocol.ReadLengthEncodedString(val[pos2:])
+				pos2 += used
+				varEnd := pos2 + int(varLen)
+				if varEnd > len(val) {
+					break
+				}
+				k, kUsed, _, err := protocol.ReadLengthEncodedString(val[pos2:varEnd])
 				if err != nil {
 					break
 				}
-				pos2 += u2
+				pos2 += kUsed
+				v, vUsed, _, err := protocol.ReadLengthEncodedString(val[pos2:varEnd])
+				if err != nil {
+					break
+				}
+				pos2 += vUsed
 
-				c.tracef("session track (type 0x%02x): %s = %s", typ, k, v)
+				c.tracef("session track (type 0x%02x): %s = %s", typ, string(k), string(v))
 				if string(k) == "ob_capability_flag" || string(k) == "__proxy_capability_flag" {
 					capVal, _ := strconv.ParseUint(string(v), 10, 64)
 					if capVal&protocol.OBCapOBProtocolV2 != 0 {
 						c.ob20Confirmed = true
-						c.tracef("OceanBase 2.0 protocol confirmed by server: %s = %d", k, capVal)
+						c.tracef("OceanBase 2.0 protocol confirmed by server: %s = %s", string(k), string(v))
 					} else {
 						c.ob20Declined = true
-						c.tracef("OceanBase 2.0 protocol explicitly declined by server: %s = %d", k, capVal)
+						c.tracef("OceanBase 2.0 protocol explicitly declined by server: %s = %s", string(k), string(v))
 					}
+				}
+				if pos2 < varEnd {
+					pos2 = varEnd
 				}
 			}
 		case 0x01:
