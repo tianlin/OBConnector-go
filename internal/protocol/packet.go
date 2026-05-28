@@ -28,6 +28,7 @@ func (e *SeqError) Temporary() bool { return false }
 var _ net.Error = (*SeqError)(nil)
 
 const maxPayloadLen = 1<<24 - 1
+const maxOB20Chunk = maxPayloadLen - OB20HeaderLen - OB20TailLen - 4
 
 type PacketConn struct {
 	rw               io.ReadWriter
@@ -39,6 +40,7 @@ type PacketConn struct {
 	extraInfos       []OB20ExtraInfo
 	mysqlBuf         []byte
 	ob20NewExtraInfo bool
+	ob20Checksum     bool
 	traceWriter      io.Writer
 	compressed       bool
 	compressBuf      bytes.Buffer
@@ -56,11 +58,12 @@ func (c *PacketConn) ResetSequence() {
 	c.seq = 0
 }
 
-func (c *PacketConn) EnableOB20(connectionID uint32, magic uint16, newExtraInfo bool) {
+func (c *PacketConn) EnableOB20(connectionID uint32, magic uint16, newExtraInfo bool, disableChecksum bool) {
 	c.ob20 = true
 	c.ob20Magic = magic
 	c.connectionID = connectionID
 	c.ob20NewExtraInfo = newExtraInfo
+	c.ob20Checksum = !disableChecksum
 }
 
 func (c *PacketConn) AddExtraInfo(typ uint16, data []byte) {
@@ -104,6 +107,16 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 				return nil, fmt.Errorf("invalid OB 2.0 header")
 			}
 
+			// Validate compressLength consistency
+			expectedCompressLen := uint32(OB20HeaderLen + int(h.PayloadLen) + OB20TailLen)
+			if h.CompressLength != expectedCompressLen {
+				return nil, fmt.Errorf("OB20 packet length mismatch: compressLength=%d, expected=%d (payload=%d)",
+					h.CompressLength, expectedCompressLen, h.PayloadLen)
+			}
+			if h.UncompressLength != 0 {
+				return nil, fmt.Errorf("OB20 unexpected uncompress length: %d", h.UncompressLength)
+			}
+
 			c.traceOB20RX("OB20 frame: magic=0x%04x version=%d connID=%d reqID=%d seq=%d payload=%d flags=%s",
 				h.MagicNum, h.Version, h.ConnectionID, h.RequestID,
 				h.PacketSeq, h.PayloadLen, ob20FlagNames(h.Flag))
@@ -119,7 +132,7 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 			}
 
 			expectedChecksum := binary.LittleEndian.Uint32(obTrailer[:])
-			if OB20PayloadChecksum(obPayload) != expectedChecksum {
+			if expectedChecksum != 0 && OB20PayloadChecksum(obPayload) != expectedChecksum {
 				return nil, fmt.Errorf("invalid OB 2.0 payload checksum: expected 0x%08x, got 0x%08x", expectedChecksum, OB20PayloadChecksum(obPayload))
 			}
 
@@ -213,8 +226,12 @@ func (c *PacketConn) ReadPacket() ([]byte, error) {
 func (c *PacketConn) WritePacket(payload []byte) error {
 	for {
 		chunkLen := len(payload)
-		if chunkLen > maxPayloadLen {
-			chunkLen = maxPayloadLen
+		chunkLimit := maxPayloadLen
+		if c.ob20 {
+			chunkLimit = maxOB20Chunk
+		}
+		if chunkLen > chunkLimit {
+			chunkLen = chunkLimit
 		}
 
 		mysqlLen := 4 + chunkLen
@@ -277,12 +294,19 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 
 			var obHeaderBuf [TotalHeaderLen]byte
 			h.Encode(obHeaderBuf[:])
+			if !c.ob20Checksum {
+				obHeaderBuf[TotalHeaderLen-2] = 0
+				obHeaderBuf[TotalHeaderLen-1] = 0
+			}
 
 			if c.traceWriter != nil {
 				fullFrame := make([]byte, 0, TotalHeaderLen+len(payloadBuf)+OB20TailLen)
 				fullFrame = append(fullFrame, obHeaderBuf[:]...)
 				fullFrame = append(fullFrame, payloadBuf...)
 				tail := OB20PayloadChecksum(payloadBuf)
+				if !c.ob20Checksum {
+					tail = 0
+				}
 				var tailBuf [4]byte
 				binary.LittleEndian.PutUint32(tailBuf[:], tail)
 				fullFrame = append(fullFrame, tailBuf[:]...)
@@ -299,6 +323,9 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 			}
 
 			tail := OB20PayloadChecksum(payloadBuf)
+			if !c.ob20Checksum {
+				tail = 0
+			}
 			var obTrailer [4]byte
 			binary.LittleEndian.PutUint32(obTrailer[:], tail)
 			if _, err := c.rw.Write(obTrailer[:]); err != nil {
@@ -356,7 +383,7 @@ func (c *PacketConn) WritePacket(payload []byte) error {
 		}
 
 		payload = payload[chunkLen:]
-		if chunkLen < maxPayloadLen {
+		if chunkLen < chunkLimit {
 			return nil
 		}
 		if len(payload) == 0 {
@@ -396,6 +423,10 @@ func (c *PacketConn) writeEmptyContinuation() error {
 
 		var obHeaderBuf [TotalHeaderLen]byte
 		h.Encode(obHeaderBuf[:])
+		if !c.ob20Checksum {
+			obHeaderBuf[TotalHeaderLen-2] = 0
+			obHeaderBuf[TotalHeaderLen-1] = 0
+		}
 
 		if _, err := c.rw.Write(obHeaderBuf[:]); err != nil {
 			return err
@@ -405,6 +436,9 @@ func (c *PacketConn) writeEmptyContinuation() error {
 		}
 
 		tail := OB20PayloadChecksum(mysqlHeader)
+		if !c.ob20Checksum {
+			tail = 0
+		}
 		var obTrailer [4]byte
 		binary.LittleEndian.PutUint32(obTrailer[:], tail)
 		_, err := c.rw.Write(obTrailer[:])

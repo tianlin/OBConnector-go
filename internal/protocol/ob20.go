@@ -96,7 +96,10 @@ func (h *OB20Header) Decode(buf []byte) bool {
 	h.Reserved = binary.LittleEndian.Uint16(buf[27:29])
 	h.HeaderCRC = binary.LittleEndian.Uint16(buf[29:31])
 
-	return h.HeaderCRC == CRC16(buf[0:29])
+	if h.HeaderCRC != 0 {
+		return h.HeaderCRC == CRC16(buf[0:29])
+	}
+	return true
 }
 
 // PeekIsOB20 peeks at the buffer to check if it has a valid OB20 header format without verifying CRC.

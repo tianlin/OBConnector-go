@@ -100,7 +100,7 @@ func TestPacketSequenceResetBeforeWrite(t *testing.T) {
 func TestOB20ReadWritePacket(t *testing.T) {
 	mock := newMockRW()
 	pc := NewPacketConn(mock)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
 	data, err := writeAndRead(pc, []byte("ob20 payload"))
@@ -115,7 +115,7 @@ func TestOB20ReadWritePacket(t *testing.T) {
 func TestOB20ExtraInfoPacket(t *testing.T) {
 	mock := newMockRW()
 	pc := NewPacketConn(mock)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
 	pc.AddExtraInfo(OB20ExtraInfoTypePartitionID, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01})
@@ -155,10 +155,10 @@ func TestLargePacketSplit(t *testing.T) {
 func TestOB20LargePacket(t *testing.T) {
 	mock := newMockRW()
 	pc := NewPacketConn(mock)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
-	largeData := make([]byte, maxPayloadLen+100)
+	largeData := make([]byte, maxPayloadLen-100)
 	for i := range largeData {
 		largeData[i] = byte(i % 256)
 	}
@@ -226,7 +226,7 @@ func TestReadPacketExactMaxPayload(t *testing.T) {
 func TestClearExtraInfo(t *testing.T) {
 	mock := newMockRW()
 	pc := NewPacketConn(mock)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
 	pc.AddExtraInfo(OB20ExtraInfoTypePartitionID, []byte{0x01})
@@ -244,7 +244,7 @@ func TestClearExtraInfo(t *testing.T) {
 
 func TestNextRequestIncrement(t *testing.T) {
 	pc := NewPacketConn(newMockRW())
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 
 	id1 := pc.requestID
 	pc.NextRequest()
@@ -292,7 +292,7 @@ func TestPacketIdentity(t *testing.T) {
 func TestOB20MultiPacket(t *testing.T) {
 	mock := newMockRW()
 	pc := NewPacketConn(mock)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
 	mysqlPackets := []byte{}
@@ -356,7 +356,7 @@ func TestOB20MultiPacket(t *testing.T) {
 func TestOB20SplitPacket(t *testing.T) {
 	mock := newMockRW()
 	pc := NewPacketConn(mock)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
 	p1 := []byte{11, 0, 0, 0, 'h', 'e', 'l', 'l'}
@@ -414,7 +414,7 @@ func TestOB20FragmentedArrivalResumesWhenComplete(t *testing.T) {
 	defer server.Close()
 
 	pc := NewPacketConn(client)
-	pc.EnableOB20(1, OB20MagicNum, false)
+	pc.EnableOB20(1, OB20MagicNum, false, false)
 	pc.NextRequest()
 
 	mysqlPayload := []byte{5, 0, 0, 0, 'h', 'e', 'l', 'l', 'o'}

@@ -407,8 +407,8 @@ func (c *Conn) handleAuthResult(hs *handshake) error {
 				if c.cfg.OB20Magic != 0 {
 					magic = c.cfg.OB20Magic
 				}
-				c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x, NewExtraInfo: true)", hs.connectionID, magic)
-				c.packets.EnableOB20(hs.connectionID, magic, true)
+				c.tracef("enabling OB 2.0 protocol encapsulation (ConnectionID: %d, Magic: 0x%04x, NewExtraInfo: true, Checksums: %v)", hs.connectionID, magic, !c.cfg.DisableOB20Checksum)
+				c.packets.EnableOB20(hs.connectionID, magic, true, c.cfg.DisableOB20Checksum)
 			}
 			envOverride := os.Getenv("OB_USE_COMPRESSION")
 			negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)

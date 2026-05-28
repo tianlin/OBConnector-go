@@ -31,8 +31,9 @@ type Config struct {
 	Preset         string
 	Trace          bool
 	TraceWriter    io.Writer
-	ProtocolV2     bool
-	OB20Magic      uint16
+	ProtocolV2         bool
+	OB20Magic          uint16
+	DisableOB20Checksum bool
 	TLSConfig      *tls.Config
 	UseCompression bool
 }
@@ -307,6 +308,13 @@ func applyQuery(cfg *Config, values url.Values) error {
 			return fmt.Errorf("invalid ob20.magic: %w", err)
 		}
 		cfg.OB20Magic = uint16(v)
+	}
+	if disableChecksum := getQueryValue(values, "ob20.disableChecksum"); disableChecksum != "" {
+		enabled, err := strconv.ParseBool(disableChecksum)
+		if err != nil {
+			return fmt.Errorf("invalid ob20.disableChecksum: %w", err)
+		}
+		cfg.DisableOB20Checksum = enabled
 	}
 	if compress := getQueryValue(values, "useCompression", "compress", "use_compression"); compress != "" {
 		enabled, err := strconv.ParseBool(compress)
