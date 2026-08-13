@@ -21,15 +21,25 @@ func normalizeOracleMode(value string) (string, error) {
 	}
 }
 
+func isTwoDigits(value string) bool {
+	return len(value) == 2 && value[0] >= '0' && value[0] <= '9' && value[1] >= '0' && value[1] <= '9'
+}
+
 func parseSessionTimeZone(value string) (*time.Location, string, error) {
 	value = strings.TrimSpace(value)
 	if strings.EqualFold(value, "utc") || strings.EqualFold(value, "z") {
 		return time.UTC, "+00:00", nil
 	}
 	if len(value) == 6 && (value[0] == '+' || value[0] == '-') && value[3] == ':' {
+		if !isTwoDigits(value[1:3]) {
+			return nil, "", fmt.Errorf("invalid hour in %q", value)
+		}
 		hour, err := strconv.Atoi(value[1:3])
 		if err != nil {
 			return nil, "", fmt.Errorf("invalid hour in %q", value)
+		}
+		if !isTwoDigits(value[4:6]) {
+			return nil, "", fmt.Errorf("invalid minute in %q", value)
 		}
 		minute, err := strconv.Atoi(value[4:6])
 		if err != nil {

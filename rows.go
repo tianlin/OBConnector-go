@@ -23,6 +23,7 @@ type columnDef struct {
 
 const notNullFlag uint16 = 0x0001
 const maxDrainRows = 10000
+const maxResultColumns = 10000
 
 type Rows struct {
 	conn            *Conn
@@ -34,6 +35,7 @@ type Rows struct {
 	streaming       bool
 	binary          bool
 	resultSetOK     bool
+	sessionTrack    bool
 	sessionLocation *time.Location
 	done            bool
 	closed          bool
@@ -73,7 +75,7 @@ func (r *Rows) drain() error {
 			return r.conn.markProtocolError(err)
 		}
 		if r.isResultSetTerminator(packet) {
-			if resultSetTerminatorHasMoreResults(packet) {
+			if resultSetTerminatorHasMoreResults(packet, r.sessionTrack) {
 				return r.conn.drainRemainingResults()
 			}
 			return nil
@@ -97,7 +99,7 @@ func (r *Rows) nextStreaming(dest []driver.Value) error {
 		return err
 	}
 	if r.isResultSetTerminator(packet) {
-		if resultSetTerminatorHasMoreResults(packet) {
+		if resultSetTerminatorHasMoreResults(packet, r.sessionTrack) {
 			if err := r.conn.drainRemainingResults(); err != nil {
 				r.finish()
 				return err
@@ -137,7 +139,7 @@ func (r *Rows) nextStreaming(dest []driver.Value) error {
 
 func (r *Rows) isResultSetTerminator(packet []byte) bool {
 	if r.resultSetOK {
-		return isResultSetOKPacket(packet)
+		return isResultSetOKPacket(packet, r.sessionTrack)
 	}
 	return isEOFPacket(packet)
 }
@@ -220,6 +222,9 @@ func (c *Conn) readQueryResult() (driver.Rows, error) {
 	if err != nil {
 		return nil, c.markProtocolError(err)
 	}
+	if columnCount > maxResultColumns {
+		return nil, c.markProtocolError(fmt.Errorf("oceanbase: result set column count %d exceeds maximum %d", columnCount, maxResultColumns))
+	}
 	colDefs := make([]columnDef, 0, columnCount)
 	columns := make([]string, 0, columnCount)
 	types := make([]byte, 0, columnCount)
@@ -242,7 +247,7 @@ func (c *Conn) readQueryResult() (driver.Rows, error) {
 		if err != nil {
 			return nil, c.markProtocolError(err)
 		}
-		resultSetOK = isResultSetOKPacket(terminator)
+		resultSetOK = isResultSetOKPacket(terminator, c.sessionTrack)
 	}
 
 	return &Rows{
@@ -252,6 +257,7 @@ func (c *Conn) readQueryResult() (driver.Rows, error) {
 		types:           types,
 		streaming:       true,
 		resultSetOK:     resultSetOK,
+		sessionTrack:    c.sessionTrack,
 		sessionLocation: c.sessionLocation,
 	}, nil
 }
@@ -330,6 +336,9 @@ func (c *Conn) drainResultSetAfterColumnCount(first []byte) (bool, error) {
 	if err != nil {
 		return false, c.markProtocolError(err)
 	}
+	if columnCount > maxResultColumns {
+		return false, c.markProtocolError(fmt.Errorf("oceanbase: result set column count %d exceeds maximum %d", columnCount, maxResultColumns))
+	}
 	for i := uint64(0); i < columnCount; i++ {
 		if _, err := c.packets.ReadPacket(); err != nil {
 			return false, c.markProtocolError(err)
@@ -342,7 +351,7 @@ func (c *Conn) drainResultSetAfterColumnCount(first []byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		resultSetOK = isResultSetOKPacket(metadataTerminator)
+		resultSetOK = isResultSetOKPacket(metadataTerminator, c.sessionTrack)
 	}
 	for i := 0; i < maxDrainRows; i++ {
 		packet, err := c.packets.ReadPacket()
@@ -352,8 +361,8 @@ func (c *Conn) drainResultSetAfterColumnCount(first []byte) (bool, error) {
 		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
 			return false, c.markProtocolError(parseServerError(packet))
 		}
-		if isResultSetTerminatorForMode(packet, resultSetOK) {
-			return resultSetTerminatorHasMoreResults(packet), nil
+		if isResultSetTerminatorForMode(packet, resultSetOK, c.sessionTrack) {
+			return resultSetTerminatorHasMoreResults(packet, c.sessionTrack), nil
 		}
 	}
 
@@ -374,7 +383,7 @@ func (c *Conn) readEOFOrOKPacket() ([]byte, error) {
 	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
 		return nil, c.markProtocolError(parseServerError(packet))
 	}
-	if !isEOFOrOK(packet) {
+	if !isEOFOrOK(packet, c.sessionTrack) {
 		if len(packet) == 0 {
 			return nil, c.markProtocolError(io.ErrUnexpectedEOF)
 		}
@@ -391,7 +400,7 @@ func (c *Conn) readResultSetTerminatorPacket() ([]byte, error) {
 	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
 		return nil, c.markProtocolError(parseServerError(packet))
 	}
-	if !isResultSetTerminatorPacket(packet) {
+	if !isResultSetTerminatorPacket(packet, c.sessionTrack) {
 		if len(packet) == 0 {
 			return nil, c.markProtocolError(io.ErrUnexpectedEOF)
 		}
@@ -400,7 +409,7 @@ func (c *Conn) readResultSetTerminatorPacket() ([]byte, error) {
 	return packet, nil
 }
 
-func isEOFOrOK(packet []byte) bool {
+func isEOFOrOK(packet []byte, sessionTrack bool) bool {
 	if len(packet) == 0 {
 		return false
 	}
@@ -408,9 +417,9 @@ func isEOFOrOK(packet []byte) bool {
 	case protocol.ErrPacket:
 		return false
 	case protocol.OKPacket:
-		return isOKPacket(packet)
+		return isOKPacket(packet, sessionTrack)
 	case protocol.EOFPacket:
-		return isResultSetTerminatorPacket(packet)
+		return isResultSetTerminatorPacket(packet, sessionTrack)
 	}
 	return false
 }
@@ -419,42 +428,42 @@ func isEOFPacket(packet []byte) bool {
 	return (len(packet) == 1 || len(packet) == 5) && packet[0] == protocol.EOFPacket
 }
 
-func isOKPacket(packet []byte) bool {
-	return isOKPacketWithHeader(packet, protocol.OKPacket)
+func isOKPacket(packet []byte, sessionTrack bool) bool {
+	return isOKPacketWithHeader(packet, protocol.OKPacket, sessionTrack)
 }
 
-func isResultSetOKPacket(packet []byte) bool {
-	return isOKPacketWithHeader(packet, protocol.EOFPacket)
+func isResultSetOKPacket(packet []byte, sessionTrack bool) bool {
+	return isOKPacketWithHeader(packet, protocol.EOFPacket, sessionTrack)
 }
 
-func isResultSetTerminatorPacket(packet []byte) bool {
-	return isEOFPacket(packet) || isResultSetOKPacket(packet)
+func isResultSetTerminatorPacket(packet []byte, sessionTrack bool) bool {
+	return isEOFPacket(packet) || isResultSetOKPacket(packet, sessionTrack)
 }
 
-func isResultSetTerminatorForMode(packet []byte, resultSetOK bool) bool {
+func isResultSetTerminatorForMode(packet []byte, resultSetOK, sessionTrack bool) bool {
 	if resultSetOK {
-		return isResultSetOKPacket(packet)
+		return isResultSetOKPacket(packet, sessionTrack)
 	}
 	return isEOFPacket(packet)
 }
 
-func resultSetTerminatorHasMoreResults(packet []byte) bool {
+func resultSetTerminatorHasMoreResults(packet []byte, sessionTrack bool) bool {
 	if isEOFPacket(packet) {
 		if len(packet) < 5 {
 			return false
 		}
 		return binary.LittleEndian.Uint16(packet[3:5])&protocol.ServerMoreResultsExists != 0
 	}
-	status, ok := packetStatusFlags(packet, protocol.EOFPacket)
+	status, ok := packetStatusFlags(packet, protocol.EOFPacket, sessionTrack)
 	return ok && status&protocol.ServerMoreResultsExists != 0
 }
 
-func isOKPacketWithHeader(packet []byte, header byte) bool {
-	_, ok := packetStatusFlags(packet, header)
+func isOKPacketWithHeader(packet []byte, header byte, sessionTrack bool) bool {
+	_, ok := packetStatusFlags(packet, header, sessionTrack)
 	return ok
 }
 
-func packetStatusFlags(packet []byte, header byte) (uint16, bool) {
+func packetStatusFlags(packet []byte, header byte, sessionTrack bool) (uint16, bool) {
 	if len(packet) == 0 || packet[0] != header {
 		return 0, false
 	}
@@ -474,6 +483,9 @@ func packetStatusFlags(packet []byte, header byte) (uint16, bool) {
 	status := binary.LittleEndian.Uint16(packet[pos : pos+2])
 	pos += 4 // status flags and warnings
 	if pos == len(packet) {
+		return status, true
+	}
+	if !sessionTrack {
 		return status, true
 	}
 	_, used, _, err = protocol.ReadLengthEncodedString(packet[pos:])

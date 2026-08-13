@@ -81,6 +81,36 @@ func TestStmtBulkExecLockedRetiresConnectionOnMalformedOK(t *testing.T) {
 	}
 }
 
+func TestResetStmtRejectsUnexpectedResponsePacket(t *testing.T) {
+	conn, serverResult := newStatementResponseConn(t, []byte{protocol.EOFPacket})
+	defer conn.netConn.Close()
+
+	if err := conn.resetStmt(1); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("resetStmt() error = %v, want driver.ErrBadConn", err)
+	}
+	if !conn.bad.Load() {
+		t.Fatal("connection should be retired after an unexpected statement reset response")
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatalf("server exchange error = %v", err)
+	}
+}
+
+func TestPingRejectsUnexpectedResponsePacket(t *testing.T) {
+	conn, serverResult := newStatementResponseConn(t, []byte{protocol.EOFPacket})
+	defer conn.netConn.Close()
+
+	if err := conn.Ping(context.Background()); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Ping() error = %v, want driver.ErrBadConn", err)
+	}
+	if !conn.bad.Load() {
+		t.Fatal("connection should be retired after an unexpected ping response")
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatalf("server exchange error = %v", err)
+	}
+}
+
 func newStatementResponseConn(t *testing.T, response []byte) (*Conn, <-chan error) {
 	t.Helper()
 	client, server := net.Pipe()

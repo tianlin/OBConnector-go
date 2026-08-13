@@ -166,7 +166,9 @@ func (c *Conn) handshake() error {
 	}
 
 	response := c.buildHandshakeResponse(hs, authResp)
-	c.deprecateEOF = binary.LittleEndian.Uint32(response[:4])&protocol.ClientDeprecateEOF != 0
+	clientCaps := binary.LittleEndian.Uint32(response[:4])
+	c.deprecateEOF = clientCaps&protocol.ClientDeprecateEOF != 0
+	c.sessionTrack = clientCaps&protocol.ClientSessionTrack != 0 && hs.capabilities&protocol.ClientSessionTrack != 0
 	c.tracef("client handshake response: payload_len=%d", len(response))
 	if err := c.packets.WritePacket(response); err != nil {
 		return err

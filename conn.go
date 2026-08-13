@@ -27,6 +27,7 @@ type Conn struct {
 	ob20Confirmed   bool
 	ob20Declined    bool
 	deprecateEOF    bool
+	sessionTrack    bool
 	tenantMode      string
 	sessionLocation *time.Location
 
@@ -150,6 +151,9 @@ func (c *Conn) Ping(ctx context.Context) error {
 		}
 		if packet[0] == protocol.ErrPacket {
 			return c.markProtocolError(parseServerError(packet))
+		}
+		if packet[0] != protocol.OKPacket {
+			return c.markProtocolError(fmt.Errorf("oceanbase: unexpected ping response packet 0x%02x", packet[0]))
 		}
 		return nil
 	})

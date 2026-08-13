@@ -370,5 +370,8 @@ func (c *Conn) resetStmt(stmtID uint32) error {
 	if packet[0] == protocol.ErrPacket {
 		return c.markProtocolError(parseServerError(packet))
 	}
+	if packet[0] != protocol.OKPacket {
+		return c.markProtocolError(fmt.Errorf("oceanbase: unexpected statement reset response 0x%02x", packet[0]))
+	}
 	return nil
 }

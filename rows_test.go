@@ -145,6 +145,35 @@ func TestStreamingRowsBinaryOracleTimestampWithOKTerminator(t *testing.T) {
 	}
 }
 
+func TestReadResultSetTerminatorAcceptsRawInfoWithoutSessionTrack(t *testing.T) {
+	packet := []byte{protocol.EOFPacket, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 'o', 'k'}
+	buf := &bytes.Buffer{}
+	writePacket(t, buf, 0, packet)
+	conn := &Conn{packets: protocol.NewPacketConn(buf)}
+
+	got, err := conn.readResultSetTerminatorPacket()
+	if err != nil {
+		t.Fatalf("readResultSetTerminatorPacket() error = %v, want nil", err)
+	}
+	if !bytes.Equal(got, packet) {
+		t.Fatalf("terminator packet = %v, want %v", got, packet)
+	}
+}
+
+func TestReadResultSetTerminatorParsesLengthEncodedInfoWithSessionTrack(t *testing.T) {
+	status := protocol.ServerSessionStateChanged
+	packet := []byte{protocol.EOFPacket, 0x00, 0x00, byte(status), byte(status >> 8), 0x00, 0x00}
+	packet = append(packet, protocol.PutLengthEncodedString(nil, "ok")...)
+	packet = append(packet, protocol.PutLengthEncodedString(nil, "state")...)
+	buf := &bytes.Buffer{}
+	writePacket(t, buf, 0, packet)
+	conn := &Conn{packets: protocol.NewPacketConn(buf), sessionTrack: true}
+
+	if _, err := conn.readResultSetTerminatorPacket(); err != nil {
+		t.Fatalf("readResultSetTerminatorPacket() error = %v, want nil", err)
+	}
+}
+
 func TestStreamingRowsBinaryResultSetOKTerminatorDoesNotBecomeDataRow(t *testing.T) {
 	okPacket := []byte{protocol.EOFPacket, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00}
 	for _, typ := range []byte{protocol.ColumnTypeTiny, protocol.ColumnTypeVarString} {
@@ -194,17 +223,17 @@ func TestStreamingRowsBinaryResultSetOKDoesNotConsumeValidDataRow(t *testing.T) 
 
 func TestIsEOFOrOKRecognizesResultSetOKWithEOFMarker(t *testing.T) {
 	packet := []byte{protocol.EOFPacket, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00}
-	if !isEOFOrOK(packet) {
+	if !isEOFOrOK(packet, false) {
 		t.Fatal("isEOFOrOK() = false for result-set OK packet with 0xfe marker")
 	}
 }
 
 func TestIsEOFOrOKRecognizesEOFWithoutProtocol41(t *testing.T) {
 	packet := []byte{protocol.EOFPacket}
-	if !isEOFOrOK(packet) {
+	if !isEOFOrOK(packet, false) {
 		t.Fatal("isEOFOrOK() = false for a one-byte EOF packet")
 	}
-	if resultSetTerminatorHasMoreResults(packet) {
+	if resultSetTerminatorHasMoreResults(packet, false) {
 		t.Fatal("one-byte EOF packet should not report more results")
 	}
 }
@@ -215,7 +244,7 @@ func TestResultSetTerminatorHasMoreResultsRecognizesEOFAndOK(t *testing.T) {
 		{protocol.EOFPacket, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00},
 	}
 	for _, packet := range packets {
-		if !resultSetTerminatorHasMoreResults(packet) {
+		if !resultSetTerminatorHasMoreResults(packet, false) {
 			t.Errorf("resultSetTerminatorHasMoreResults(%x) = false, want true", packet)
 		}
 	}
@@ -279,6 +308,46 @@ func TestReadQueryResultAfterColumnCountDrainsMoreResults(t *testing.T) {
 	}
 	if _, err := conn.packets.ReadPacket(); !errors.Is(err, io.EOF) {
 		t.Fatalf("remaining packet error = %v, want EOF after all result sets are drained", err)
+	}
+}
+
+func TestReadQueryResultRejectsOversizedColumnCountBeforeAllocation(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("readQueryResult() panicked for oversized column count: %v", recovered)
+		}
+	}()
+
+	buf := &bytes.Buffer{}
+	writePacket(t, buf, 0, protocol.PutLengthEncodedInt(nil, ^uint64(0)))
+	conn := &Conn{packets: protocol.NewPacketConn(buf)}
+
+	if _, err := conn.readQueryResult(); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("readQueryResult() error = %v, want driver.ErrBadConn", err)
+	}
+	if !conn.bad.Load() {
+		t.Fatal("connection should be retired for oversized column count")
+	}
+}
+
+func TestReadQueryResultAfterColumnCountRejectsOversizedColumnCountBeforeReadingColumns(t *testing.T) {
+	buf := &bytes.Buffer{}
+	sentinel := []byte{0x42}
+	writePacket(t, buf, 0, sentinel)
+	conn := &Conn{packets: protocol.NewPacketConn(buf)}
+
+	if _, err := conn.readQueryResultAfterColumnCount(protocol.PutLengthEncodedInt(nil, ^uint64(0))); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("readQueryResultAfterColumnCount() error = %v, want driver.ErrBadConn", err)
+	}
+	if !conn.bad.Load() {
+		t.Fatal("connection should be retired for oversized column count")
+	}
+	packet, err := conn.packets.ReadPacket()
+	if err != nil {
+		t.Fatalf("sentinel packet read error = %v, want packet to remain unread", err)
+	}
+	if !bytes.Equal(packet, sentinel) {
+		t.Fatalf("sentinel packet = %v, want %v", packet, sentinel)
 	}
 }
 

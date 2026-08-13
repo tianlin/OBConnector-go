@@ -2,6 +2,7 @@ package oceanbase
 
 import (
 	"database/sql/driver"
+	"strings"
 	"testing"
 	"time"
 )
@@ -118,6 +119,27 @@ func TestParseSessionTimeZoneRejectsInvalidValue(t *testing.T) {
 		if _, _, err := parseSessionTimeZone(value); err == nil {
 			t.Errorf("parseSessionTimeZone(%q) error = nil, want error", value)
 		}
+	}
+}
+
+func TestParseSessionTimeZoneRejectsSignedOffsetComponents(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "+-1:00", want: "invalid hour"},
+		{value: "++5:00", want: "invalid hour"},
+		{value: "+01:-1", want: "invalid minute"},
+		{value: "+01:+1", want: "invalid minute"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			if _, _, err := parseSessionTimeZone(tt.value); err == nil {
+				t.Fatalf("parseSessionTimeZone(%q) error = nil, want %s error", tt.value, tt.want)
+			} else if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("parseSessionTimeZone(%q) error = %v, want %s error", tt.value, err, tt.want)
+			}
+		})
 	}
 }
 
