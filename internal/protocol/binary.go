@@ -58,6 +58,10 @@ func AppendBinaryTime(buf []byte, t time.Time) []byte {
 }
 
 func ParseBinaryRow(packet []byte, columnCount int, types []byte) ([]any, error) {
+	return ParseBinaryRowInLocation(packet, columnCount, types, time.UTC)
+}
+
+func ParseBinaryRowInLocation(packet []byte, columnCount int, types []byte, sessionLocation *time.Location) ([]any, error) {
 	if len(packet) == 0 || packet[0] != 0x00 {
 		return nil, fmt.Errorf("invalid binary row header")
 	}
@@ -75,17 +79,24 @@ func ParseBinaryRow(packet []byte, columnCount int, types []byte) ([]any, error)
 			row[i] = nil
 			continue
 		}
-		val, used, err := ParseBinaryValue(packet[pos:], types[i])
+		val, used, err := ParseBinaryValueInLocation(packet[pos:], types[i], sessionLocation)
 		if err != nil {
 			return nil, err
 		}
 		row[i] = val
 		pos += used
 	}
+	if pos != len(packet) {
+		return nil, fmt.Errorf("oceanbase: binary row has %d trailing bytes", len(packet)-pos)
+	}
 	return row, nil
 }
 
 func ParseBinaryValue(data []byte, typ byte) (any, int, error) {
+	return ParseBinaryValueInLocation(data, typ, time.UTC)
+}
+
+func ParseBinaryValueInLocation(data []byte, typ byte, sessionLocation *time.Location) (any, int, error) {
 	switch typ {
 	case ColumnTypeTiny:
 		if len(data) < 1 {
@@ -119,8 +130,17 @@ func ParseBinaryValue(data []byte, typ byte) (any, int, error) {
 		return math.Float64frombits(binary.LittleEndian.Uint64(data[:8])), 8, nil
 	case ColumnTypeDate, ColumnTypeTimestamp, ColumnTypeDateTime:
 		return ParseBinaryTime(data)
+	case ColumnTypeOracleTimestampTZ, ColumnTypeOracleTimestampLTZ, ColumnTypeOracleTimestampNano:
+		s, used, _, err := ReadLengthEncodedString(data)
+		if err != nil {
+			return nil, 0, err
+		}
+		value, err := ParseOracleTime(s, typ, sessionLocation)
+		if err != nil {
+			return nil, 0, err
+		}
+		return value, used, nil
 	case ColumnTypeDecimal, ColumnTypeNewDecimal, ColumnTypeVarChar, ColumnTypeVarString, ColumnTypeString, ColumnTypeBlob, ColumnTypeTinyBlob, ColumnTypeMediumBlob, ColumnTypeLongBlob,
-		ColumnTypeOracleTimestampTZ, ColumnTypeOracleTimestampLTZ, ColumnTypeOracleTimestampNano,
 		ColumnTypeOracleRaw, ColumnTypeOracleIntervalYM, ColumnTypeOracleIntervalDS,
 		ColumnTypeOracleNumberFloat, ColumnTypeOracleNVarChar2, ColumnTypeOracleNChar,
 		ColumnTypeOracleRowID, ColumnTypeOracleBlob, ColumnTypeOracleClob:

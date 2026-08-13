@@ -51,6 +51,9 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 	if err != nil {
 		return nil, s.conn.markBadIfConnErr(err)
 	}
+	if err := s.conn.updateSessionTimeZoneFromQuery(s.query, args); err != nil {
+		return nil, s.conn.markBadIfConnErr(err)
+	}
 	return res, nil
 }
 
@@ -65,6 +68,10 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 	}
 	rows, err := s.conn.stmtQueryLocked(ctx, s.stmtID, args)
 	if err != nil {
+		s.conn.mu.Unlock()
+		return nil, s.conn.markBadIfConnErr(err)
+	}
+	if err := s.conn.updateSessionTimeZoneFromQuery(s.query, args); err != nil {
 		s.conn.mu.Unlock()
 		return nil, s.conn.markBadIfConnErr(err)
 	}
@@ -87,6 +94,13 @@ func (s *Stmt) BulkExecContext(ctx context.Context, argRows [][]driver.NamedValu
 	}
 	res, err := s.conn.stmtBulkExecLocked(ctx, s.stmtID, argRows)
 	if err != nil {
+		return nil, s.conn.markBadIfConnErr(err)
+	}
+	var args []driver.NamedValue
+	if len(argRows) == 1 {
+		args = argRows[0]
+	}
+	if err := s.conn.updateSessionTimeZoneFromQuery(s.query, args); err != nil {
 		return nil, s.conn.markBadIfConnErr(err)
 	}
 	return res, nil

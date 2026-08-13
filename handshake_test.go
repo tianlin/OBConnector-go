@@ -85,6 +85,57 @@ func TestHandshakeResponseIncludesOceanBaseOracleExtensions(t *testing.T) {
 	}
 }
 
+func TestHandshakeResponseNegotiatesDeprecateEOFWithServer(t *testing.T) {
+	cfg := &Config{
+		Addr:       "127.0.0.1:2883",
+		User:       "test",
+		Password:   "test-password",
+		Timeout:    time.Second,
+		Attributes: map[string]string{},
+	}
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	conn := &Conn{cfg: cfg}
+	hs := &handshake{
+		capabilities: protocol.ClientProtocol41 | protocol.ClientDeprecateEOF,
+		authPlugin:   "mysql_native_password",
+		authSeed:     []byte("12345678901234567890"),
+	}
+	authResp, err := buildAuthResponse(hs.authPlugin, cfg.Password, hs.authSeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := conn.buildHandshakeResponse(hs, authResp)
+	caps := binary.LittleEndian.Uint32(response[:4])
+	if caps&protocol.ClientDeprecateEOF == 0 {
+		t.Fatalf("CLIENT_DEPRECATE_EOF missing from %#x when server supports it", caps)
+	}
+}
+
+func TestTenantModeFromHandshake(t *testing.T) {
+	tests := []struct {
+		name   string
+		status uint16
+		cfg    *Config
+		want   string
+	}{
+		{name: "server oracle bit", status: protocol.ServerOracleMode, cfg: &Config{}, want: "oracle"},
+		{name: "explicit oracle", cfg: &Config{OracleMode: "true"}, want: "oracle"},
+		{name: "explicit mysql", status: protocol.ServerOracleMode, cfg: &Config{OracleMode: "false"}, want: "mysql"},
+		{name: "oboracle preset", cfg: &Config{Preset: "oboracle"}, want: "oracle"},
+		{name: "auto mysql", cfg: &Config{}, want: "mysql"},
+		{name: "client identity does not imply oracle", cfg: &Config{Preset: "obclient"}, want: "mysql"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tenantModeFromHandshake(tt.status, tt.cfg); got != tt.want {
+				t.Fatalf("tenantModeFromHandshake() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNegotiateCompression(t *testing.T) {
 	cases := []struct {
 		name        string

@@ -114,6 +114,39 @@ Regression coverage:
 - Prepared statement compatibility path and `?` parameter interpolation.
 - Connection validity and bad-connection mapping.
 
+## Oracle Timestamp Result Payloads
+
+The Oracle-mode result metadata uses OceanBase-specific timestamp type codes:
+
+- `0xc8`: `TIMESTAMP WITH TIME ZONE`
+- `0xc9`: `TIMESTAMP WITH LOCAL TIME ZONE`
+- `0xca`: `TIMESTAMP`
+
+For the observed result payload, the first 12 bytes are:
+
+```text
+century, year, month, day, hour, minute, second,
+nanoseconds[4] little-endian, scale
+```
+
+`0xc8` appends signed timezone hour/minute bytes, followed by a timezone-name
+length/name and an abbreviation length/abbreviation; zero lengths are valid, but
+the length bytes themselves are required. `0xc9` has no offset in the payload
+because its displayed wall clock is determined by the session timezone. The
+driver decodes all three
+types to UTC `time.Time`; Oracle sessions default to UTC and accept the
+`sessionTimeZone=UTC` or `sessionTimeZone=+08:00` DSN options. IANA region
+session time zones are rejected because client/server tzdata can differ and
+would otherwise produce a silently wrong UTC instant.
+
+Mode detection is automatic by default. Use the `oboracle` driver, `preset=oboracle`,
+or `oracleMode=true` when the proxy/tenant handshake does not expose the Oracle
+mode status bit. The configured session timezone is restored by the
+`database/sql` connection reset hook; explicit timezone-changing SQL executed
+through this driver also updates the local LTZ decoder state.
+
+Malformed payloads are returned as errors instead of being exposed as strings.
+
 ## Experiment Plan
 
 For each experiment, capture:

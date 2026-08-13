@@ -250,6 +250,21 @@ func TestHandleOKWithEmptyInfo(t *testing.T) {
 	}
 }
 
+func TestHandleOKRejectsTruncatedStatusWithoutPanicking(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("handleOK panicked on a truncated OK packet: %v", recovered)
+		}
+	}()
+
+	// affected_rows and last_insert_id are valid, but only one byte of the
+	// required status/warnings section remains.
+	pkt := []byte{protocol.OKPacket, 0x00, 0x00, 0x01}
+	if _, _, err := (&Conn{}).handleOK(pkt); err == nil {
+		t.Fatal("handleOK() error = nil, want truncated-packet error")
+	}
+}
+
 func TestHandleOKSchemaChangeTrackType(t *testing.T) {
 	// Test session track type 0x01 (schema change)
 	// Type 0x01 format: type(1) + lenenc-string(schema_name)

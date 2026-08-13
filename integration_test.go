@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,126 @@ func openTestDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+func testOracleTimeDSN(t *testing.T) string {
+	t.Helper()
+	return testDSN(t) + "&sessionTimeZone=%2B00%3A00"
+}
+
+func TestIntegrationOracleTimestampTypes(t *testing.T) {
+	db, err := sql.Open("oboracle", testOracleTimeDSN(t))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	const query = "SELECT LOCALTIMESTAMP AS ts, CURRENT_TIMESTAMP AS tstz, CAST(CURRENT_TIMESTAMP AS TIMESTAMP WITH LOCAL TIME ZONE) AS tsltz FROM DUAL"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("ordinary query: %v", err)
+	}
+	assertOracleTimestampRows(t, rows)
+
+	stmt, err := db.PrepareContext(ctx, query)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer stmt.Close()
+	preparedRows, err := stmt.QueryContext(ctx)
+	if err != nil {
+		t.Fatalf("prepared query: %v", err)
+	}
+	assertOracleTimestampRows(t, preparedRows)
+}
+
+func TestIntegrationOracleSessionTimezoneLifecycle(t *testing.T) {
+	db, err := sql.Open("oboracle", testOracleTimeDSN(t))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "ALTER SESSION SET TIME_ZONE = '+08:00'"); err != nil {
+		conn.Close()
+		t.Fatalf("ALTER SESSION: %v", err)
+	}
+	const query = "SELECT CAST(TIMESTAMP '2026-08-12 14:45:44.123456' AS TIMESTAMP WITH LOCAL TIME ZONE) FROM DUAL"
+	var direct time.Time
+	if err := conn.QueryRowContext(ctx, query).Scan(&direct); err != nil {
+		conn.Close()
+		t.Fatalf("query after direct timezone change: %v", err)
+	}
+	if want := time.Date(2026, 8, 12, 6, 45, 44, 123456000, time.UTC); !direct.Equal(want) {
+		t.Fatalf("direct-session timestamp = %v, want %v", direct, want)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close: %v", err)
+	}
+
+	var reset time.Time
+	if err := db.QueryRowContext(ctx, query).Scan(&reset); err != nil {
+		t.Fatalf("query after pooled reset: %v", err)
+	}
+	if want := time.Date(2026, 8, 12, 14, 45, 44, 123456000, time.UTC); !reset.Equal(want) {
+		t.Fatalf("pooled-reset timestamp = %v, want %v", reset, want)
+	}
+}
+
+func assertOracleTimestampRows(t *testing.T, rows *sql.Rows) {
+	t.Helper()
+	defer rows.Close()
+
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ColumnTypes: %v", err)
+	}
+	wantNames := []string{"TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITH LOCAL TIME ZONE"}
+	if len(columnTypes) != len(wantNames) {
+		t.Fatalf("column count = %d, want %d", len(columnTypes), len(wantNames))
+	}
+	for i, want := range wantNames {
+		if got := columnTypes[i].DatabaseTypeName(); got != want {
+			t.Errorf("column %d database type = %q, want %q", i, got, want)
+		}
+		if got := columnTypes[i].ScanType(); got != reflect.TypeOf(time.Time{}) {
+			t.Errorf("column %d scan type = %v, want time.Time", i, got)
+		}
+	}
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows.Next: %v", err)
+		}
+		t.Fatal("query returned no rows")
+	}
+	var ts, tstz, tsltz time.Time
+	if err := rows.Scan(&ts, &tstz, &tsltz); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if ts.IsZero() || tstz.IsZero() || tsltz.IsZero() {
+		t.Fatalf("timestamp values must be non-zero: ts=%v tstz=%v tsltz=%v", ts, tstz, tsltz)
+	}
+	if !tstz.Equal(tsltz) {
+		t.Fatalf("TSTZ and TSLTZ should represent the same instant: tstz=%v tsltz=%v", tstz, tsltz)
+	}
+	if rows.Next() {
+		t.Fatal("query returned more than one row")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
 }
 
 func TestIntegrationConnect(t *testing.T) {

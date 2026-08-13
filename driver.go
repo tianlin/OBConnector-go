@@ -8,13 +8,15 @@ import (
 
 func init() {
 	sql.Register("oceanbase", &Driver{})
-	sql.Register("oboracle", &Driver{})
+	sql.Register("oboracle", &Driver{preset: "oboracle"})
 }
 
-type Driver struct{}
+type Driver struct {
+	preset string
+}
 
 func (d *Driver) Open(name string) (driver.Conn, error) {
-	cfg, err := ParseDSN(name)
+	cfg, err := d.parseConfig(name)
 	if err != nil {
 		return nil, err
 	}
@@ -22,11 +24,22 @@ func (d *Driver) Open(name string) (driver.Conn, error) {
 }
 
 func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
-	cfg, err := ParseDSN(name)
+	cfg, err := d.parseConfig(name)
 	if err != nil {
 		return nil, err
 	}
 	return &Connector{cfg: cfg}, nil
+}
+
+func (d *Driver) parseConfig(name string) (*Config, error) {
+	cfg, err := ParseDSN(name)
+	if err != nil {
+		return nil, err
+	}
+	if d.preset != "" {
+		cfg.Preset = d.preset
+	}
+	return cfg, nil
 }
 
 type Connector struct {

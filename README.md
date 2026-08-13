@@ -15,8 +15,9 @@ This repository intentionally does not depend on OBCI, Oracle Instant Client, Li
 ## Current State
 
 - Registers `database/sql` driver names `oceanbase` and `oboracle`.
+- The `oboracle` driver name selects the Oracle-mode client preset; the `oceanbase` driver can select it with `preset=oboracle` or force mode with `oracleMode=true`.
 - Implements a minimal MySQL-compatible wire path with OceanBase Oracle tenant handshake extensions.
-- Supports `mysql_native_password`, `COM_QUERY`, streaming text rows, server errors, basic transactions, `Prepare` compatibility, client-side `?` parameter interpolation, connection-pool lifecycle hooks, and basic column type metadata.
+- Supports `mysql_native_password`, `COM_QUERY`, streaming text rows, server errors, basic transactions, `Prepare` compatibility, client-side `?` parameter interpolation, connection-pool lifecycle hooks, basic column type metadata, and Oracle timestamp decoding.
 - Provides `cmd/obping` for connection experiments and regression testing.
 - Records protocol observations and open questions in `docs/protocol-notes.md`.
 
@@ -108,11 +109,16 @@ oceanbase:<user>:<password>@<host>:<port>/<database>?<params>
 | `oracleMode` | `true`/`false`/`auto` | Force Oracle/MySQL mode or auto-detect |
 | `ob20` | `true`/`false` | Enable OB 2.0 protocol encapsulation |
 | `preset` | `default`/`oboracle`/`obclient`/... | Client identity preset |
+| `sessionTimeZone` | `UTC` or `±HH:MM` | Oracle-mode session timezone; defaults to UTC |
 | `collation` | `uint8` | Handshake collation byte |
 | `cap.add` | `uint32` | Force capability bits on |
 | `cap.drop` | `uint32` | Force capability bits off |
 | `attr.<key>` | String | Connection attribute |
 | `init` | SQL | SQL to run after authentication (repeatable) |
+
+IANA region session time zones are rejected. Use `UTC` or a fixed offset so
+`TIMESTAMP WITH LOCAL TIME ZONE` decoding does not depend on the client and
+server having identical tzdata.
 
 ### Custom Query
 

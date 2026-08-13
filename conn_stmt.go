@@ -28,20 +28,20 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 
 		packet, err := c.packets.ReadPacket()
 		if err != nil {
-			return err
+			return c.markProtocolError(err)
 		}
 		if len(packet) == 0 {
-			return io.ErrUnexpectedEOF
+			return c.markProtocolError(io.ErrUnexpectedEOF)
 		}
 		if packet[0] == protocol.ErrPacket {
-			return parseServerError(packet)
+			return c.markProtocolError(parseServerError(packet))
 		}
 		if packet[0] != protocol.OKPacket {
-			return fmt.Errorf("oceanbase: unexpected prepare response 0x%02x", packet[0])
+			return c.markProtocolError(fmt.Errorf("oceanbase: unexpected prepare response 0x%02x", packet[0]))
 		}
 
 		if len(packet) < 12 {
-			return io.ErrUnexpectedEOF
+			return c.markProtocolError(io.ErrUnexpectedEOF)
 		}
 		s := &Stmt{
 			conn:        c,
@@ -54,21 +54,25 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 		if s.paramCount > 0 {
 			for i := 0; i < s.paramCount; i++ {
 				if _, err := c.packets.ReadPacket(); err != nil {
-					return err
+					return c.markProtocolError(err)
 				}
 			}
-			if err := c.readEOFOrOK(); err != nil {
-				return err
+			if !c.deprecateEOF {
+				if err := c.readEOFOrOK(); err != nil {
+					return err
+				}
 			}
 		}
 		if s.columnCount > 0 {
 			for i := 0; i < s.columnCount; i++ {
 				if _, err := c.packets.ReadPacket(); err != nil {
-					return err
+					return c.markProtocolError(err)
 				}
 			}
-			if err := c.readEOFOrOK(); err != nil {
-				return err
+			if !c.deprecateEOF {
+				if err := c.readEOFOrOK(); err != nil {
+					return err
+				}
 			}
 		}
 		stmt = s
@@ -109,16 +113,16 @@ func (c *Conn) stmtExecLocked(ctx context.Context, stmtID uint32, args []driver.
 		}
 		first, err := c.packets.ReadPacket()
 		if err != nil {
-			return err
+			return c.markProtocolError(err)
 		}
 		if len(first) == 0 {
-			return io.ErrUnexpectedEOF
+			return c.markProtocolError(io.ErrUnexpectedEOF)
 		}
 		switch first[0] {
 		case protocol.OKPacket:
 			res, status, err := c.handleOK(first)
 			if err != nil {
-				return err
+				return c.markProtocolError(err)
 			}
 			result = res
 			if status&protocol.ServerPSOutParams != 0 {
@@ -132,7 +136,7 @@ func (c *Conn) stmtExecLocked(ctx context.Context, stmtID uint32, args []driver.
 				}
 			}
 		case protocol.ErrPacket:
-			return parseServerError(first)
+			return c.markProtocolError(parseServerError(first))
 		default:
 			res, err := c.readResultFromFirstPacket(first)
 			if err != nil {
@@ -146,18 +150,11 @@ func (c *Conn) stmtExecLocked(ctx context.Context, stmtID uint32, args []driver.
 }
 
 func (c *Conn) drainRemainingResults() error {
-	for {
-		packet, err := c.packets.ReadPacket()
-		if err != nil {
-			return err
-		}
-		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
-			return parseServerError(packet)
-		}
-		if isEOFOrOK(packet) {
-			return nil
-		}
+	first, err := c.packets.ReadPacket()
+	if err != nil {
+		return c.markProtocolError(err)
 	}
+	return c.drainResultSetsFromFirstPacket(first)
 }
 
 func (c *Conn) readOutParams(args []driver.NamedValue) error {
@@ -286,11 +283,20 @@ func (c *Conn) stmtBulkExecLocked(ctx context.Context, stmtID uint32, argRows []
 
 		first, err := c.packets.ReadPacket()
 		if err != nil {
-			return err
+			return c.markProtocolError(err)
+		}
+		if len(first) == 0 {
+			return c.markProtocolError(io.ErrUnexpectedEOF)
+		}
+		if first[0] == protocol.ErrPacket {
+			return c.markProtocolError(parseServerError(first))
+		}
+		if first[0] != protocol.OKPacket {
+			return c.markProtocolError(fmt.Errorf("oceanbase: unexpected bulk execute response 0x%02x", first[0]))
 		}
 		res, _, err := c.handleOK(first)
 		if err != nil {
-			return err
+			return c.markProtocolError(err)
 		}
 		result = res
 		return nil
@@ -356,10 +362,13 @@ func (c *Conn) resetStmt(stmtID uint32) error {
 	}
 	packet, err := c.packets.ReadPacket()
 	if err != nil {
-		return err
+		return c.markProtocolError(err)
 	}
-	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
-		return parseServerError(packet)
+	if len(packet) == 0 {
+		return c.markProtocolError(io.ErrUnexpectedEOF)
+	}
+	if packet[0] == protocol.ErrPacket {
+		return c.markProtocolError(parseServerError(packet))
 	}
 	return nil
 }

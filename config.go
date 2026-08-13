@@ -28,6 +28,8 @@ type Config struct {
 	CapabilityDrop      uint32
 	Collation           byte
 	InitSQL             []string
+	OracleMode          string
+	SessionTimeZone     string
 	Preset              string
 	Trace               bool
 	TraceWriter         io.Writer
@@ -105,6 +107,16 @@ func (c *Config) normalize() error {
 	if c.Preset == "" {
 		c.Preset = "default"
 	}
+	mode, err := normalizeOracleMode(c.OracleMode)
+	if err != nil {
+		return err
+	}
+	c.OracleMode = mode
+	if c.SessionTimeZone != "" {
+		if _, _, err := parseSessionTimeZone(c.SessionTimeZone); err != nil {
+			return fmt.Errorf("invalid session time zone: %w", err)
+		}
+	}
 	if c.Trace && c.TraceWriter == nil {
 		c.TraceWriter = os.Stderr
 	}
@@ -144,6 +156,9 @@ func parseURLDSN(dsn string) (*Config, error) {
 
 	if err := applyQuery(cfg, u.Query()); err != nil {
 		return nil, err
+	}
+	if u.Scheme == "oboracle" {
+		cfg.Preset = "oboracle"
 	}
 
 	return cfg, cfg.normalize()
@@ -197,6 +212,9 @@ func parseOpaqueDSN(dsn string) (*Config, error) {
 		if err := applyQuery(cfg, values); err != nil {
 			return nil, err
 		}
+	}
+	if strings.HasPrefix(dsn, "oboracle:") {
+		cfg.Preset = "oboracle"
 	}
 	return cfg, cfg.normalize()
 }
@@ -294,6 +312,16 @@ func applyQuery(cfg *Config, values url.Values) error {
 	}
 	if preset := getQueryValue(values, "preset"); preset != "" {
 		cfg.Preset = preset
+	}
+	if oracleMode := getQueryValue(values, "oracleMode", "oracle_mode"); oracleMode != "" {
+		mode, err := normalizeOracleMode(oracleMode)
+		if err != nil {
+			return err
+		}
+		cfg.OracleMode = mode
+	}
+	if sessionTimeZone := getQueryValue(values, "sessionTimeZone", "session_timezone"); sessionTimeZone != "" {
+		cfg.SessionTimeZone = sessionTimeZone
 	}
 	if v2 := getQueryValue(values, "ob20", "protocol.v2"); v2 != "" {
 		enabled, err := strconv.ParseBool(v2)

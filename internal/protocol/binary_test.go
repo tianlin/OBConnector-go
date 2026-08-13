@@ -246,6 +246,44 @@ func TestParseBinaryValue(t *testing.T) {
 	}
 }
 
+func TestParseBinaryValueOracleTimestamp(t *testing.T) {
+	raw := oracleTimestampPayload()
+	data := PutLengthEncodedString(nil, string(raw))
+
+	got, used, err := ParseBinaryValue(data, ColumnTypeOracleTimestampNano)
+	if err != nil {
+		t.Fatalf("ParseBinaryValue() error = %v", err)
+	}
+	want := time.Date(2026, 8, 12, 14, 45, 44, 873432000, time.UTC)
+	if got != want {
+		t.Fatalf("value = %#v, want %#v", got, want)
+	}
+	if used != len(data) {
+		t.Fatalf("used = %d, want %d", used, len(data))
+	}
+}
+
+func TestParseBinaryRowRejectsTrailingBytes(t *testing.T) {
+	packet := []byte{0x00, 0x00, 0x01, 0x7f}
+	if _, err := ParseBinaryRow(packet, 1, []byte{ColumnTypeTiny}); err == nil {
+		t.Fatal("ParseBinaryRow() error = nil, want trailing-byte error")
+	}
+}
+
+func TestParseBinaryRowOracleLocalTimestampUsesSessionLocation(t *testing.T) {
+	raw := PutLengthEncodedString(nil, string(oracleTimestampPayload()))
+	packet := append([]byte{0x00, 0x00}, raw...)
+
+	row, err := ParseBinaryRowInLocation(packet, 1, []byte{ColumnTypeOracleTimestampLTZ}, time.FixedZone("UTC+08:00", 8*60*60))
+	if err != nil {
+		t.Fatalf("ParseBinaryRowInLocation() error = %v", err)
+	}
+	want := time.Date(2026, 8, 12, 6, 45, 44, 873432000, time.UTC)
+	if row[0] != want {
+		t.Fatalf("row[0] = %#v, want %#v", row[0], want)
+	}
+}
+
 func TestParseBinaryRow(t *testing.T) {
 	// Build a row with 3 columns: TINY(1), VARCHAR("hi"), NULL
 	// Binary row format: header(0x00) + null-bitmap + values

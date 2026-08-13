@@ -22,19 +22,22 @@ type columnDef struct {
 }
 
 const notNullFlag uint16 = 0x0001
+const maxDrainRows = 10000
 
 type Rows struct {
-	conn      *Conn
-	colDefs   []columnDef
-	columns   []string
-	types     []byte
-	values    [][]driver.Value
-	pos       int
-	streaming bool
-	binary    bool
-	done      bool
-	closed    bool
-	release   func()
+	conn            *Conn
+	colDefs         []columnDef
+	columns         []string
+	types           []byte
+	values          [][]driver.Value
+	pos             int
+	streaming       bool
+	binary          bool
+	resultSetOK     bool
+	sessionLocation *time.Location
+	done            bool
+	closed          bool
+	release         func()
 }
 
 func (r *Rows) Columns() []string {
@@ -64,18 +67,19 @@ func (r *Rows) finish() {
 }
 
 func (r *Rows) drain() error {
-	const maxDrainRows = 10000
 	for i := 0; i < maxDrainRows; i++ {
 		packet, err := r.conn.packets.ReadPacket()
 		if err != nil {
-			_ = r.conn.markBadIfConnErr(err)
-			return err
+			return r.conn.markProtocolError(err)
 		}
-		if isEOFOrOK(packet) {
+		if r.isResultSetTerminator(packet) {
+			if resultSetTerminatorHasMoreResults(packet) {
+				return r.conn.drainRemainingResults()
+			}
 			return nil
 		}
 		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
-			return parseServerError(packet)
+			return r.conn.markProtocolError(parseServerError(packet))
 		}
 	}
 	r.conn.bad.Store(true)
@@ -88,22 +92,29 @@ func (r *Rows) nextStreaming(dest []driver.Value) error {
 	}
 	packet, err := r.conn.packets.ReadPacket()
 	if err != nil {
-		_ = r.conn.markBadIfConnErr(err)
+		err = r.conn.markProtocolError(err)
 		r.finish()
 		return err
 	}
-	if isEOFOrOK(packet) {
+	if r.isResultSetTerminator(packet) {
+		if resultSetTerminatorHasMoreResults(packet) {
+			if err := r.conn.drainRemainingResults(); err != nil {
+				r.finish()
+				return err
+			}
+		}
 		r.finish()
 		return io.EOF
 	}
 	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
 		r.finish()
-		return parseServerError(packet)
+		return r.conn.markProtocolError(parseServerError(packet))
 	}
 	var row []driver.Value
 	if r.binary {
-		binaryRow, err := protocol.ParseBinaryRow(packet, len(r.columns), r.types)
+		binaryRow, err := protocol.ParseBinaryRowInLocation(packet, len(r.columns), r.types, r.sessionLocation)
 		if err != nil {
+			r.conn.bad.Store(true)
 			r.finish()
 			return err
 		}
@@ -112,8 +123,9 @@ func (r *Rows) nextStreaming(dest []driver.Value) error {
 			row[i] = v
 		}
 	} else {
-		textRow, err := parseTextRow(packet, len(r.columns), r.types)
+		textRow, err := parseTextRowInLocation(packet, len(r.columns), r.types, r.sessionLocation)
 		if err != nil {
+			r.conn.bad.Store(true)
 			r.finish()
 			return err
 		}
@@ -121,6 +133,13 @@ func (r *Rows) nextStreaming(dest []driver.Value) error {
 	}
 	copy(dest, row)
 	return nil
+}
+
+func (r *Rows) isResultSetTerminator(packet []byte) bool {
+	if r.resultSetOK {
+		return isResultSetOKPacket(packet)
+	}
+	return isEOFPacket(packet)
 }
 
 func (r *Rows) Next(dest []driver.Value) error {
@@ -176,21 +195,30 @@ func (r *Rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok b
 func (c *Conn) readQueryResult() (driver.Rows, error) {
 	first, err := c.packets.ReadPacket()
 	if err != nil {
-		return nil, err
+		return nil, c.markProtocolError(err)
 	}
 	if len(first) == 0 {
-		return nil, io.ErrUnexpectedEOF
+		return nil, c.markProtocolError(io.ErrUnexpectedEOF)
 	}
 	if first[0] == protocol.ErrPacket {
-		return nil, parseServerError(first)
+		return nil, c.markProtocolError(parseServerError(first))
 	}
 	if first[0] == protocol.OKPacket {
+		_, status, err := c.handleOK(first)
+		if err != nil {
+			return nil, c.markProtocolError(err)
+		}
+		if status&protocol.ServerMoreResultsExists != 0 {
+			if err := c.drainRemainingResults(); err != nil {
+				return nil, err
+			}
+		}
 		return &Rows{done: true}, nil
 	}
 
 	columnCount, _, _, err := protocol.ReadLengthEncodedInt(first)
 	if err != nil {
-		return nil, err
+		return nil, c.markProtocolError(err)
 	}
 	colDefs := make([]columnDef, 0, columnCount)
 	columns := make([]string, 0, columnCount)
@@ -198,32 +226,45 @@ func (c *Conn) readQueryResult() (driver.Rows, error) {
 	for i := uint64(0); i < columnCount; i++ {
 		packet, err := c.packets.ReadPacket()
 		if err != nil {
-			return nil, err
+			return nil, c.markProtocolError(err)
 		}
 		cd, err := parseColumnDefinition(packet)
 		if err != nil {
-			return nil, err
+			return nil, c.markProtocolError(err)
 		}
 		colDefs = append(colDefs, cd)
 		columns = append(columns, cd.name)
 		types = append(types, cd.typ)
 	}
-	if err := c.readEOFOrOK(); err != nil {
-		return nil, err
+	resultSetOK := c.deprecateEOF
+	if !c.deprecateEOF {
+		terminator, err := c.readResultSetTerminatorPacket()
+		if err != nil {
+			return nil, c.markProtocolError(err)
+		}
+		resultSetOK = isResultSetOKPacket(terminator)
 	}
 
-	return &Rows{conn: c, colDefs: colDefs, columns: columns, types: types, streaming: true}, nil
+	return &Rows{
+		conn:            c,
+		colDefs:         colDefs,
+		columns:         columns,
+		types:           types,
+		streaming:       true,
+		resultSetOK:     resultSetOK,
+		sessionLocation: c.sessionLocation,
+	}, nil
 }
 
 func (c *Conn) readResultFromFirstPacket(packet []byte) (driver.Result, error) {
 	if len(packet) == 0 {
-		return nil, io.ErrUnexpectedEOF
+		return nil, c.markProtocolError(io.ErrUnexpectedEOF)
 	}
 	switch packet[0] {
 	case protocol.OKPacket:
 		res, status, err := c.handleOK(packet)
 		if err != nil {
-			return nil, err
+			return nil, c.markProtocolError(err)
 		}
 		if status&protocol.ServerMoreResultsExists != 0 {
 			if err := c.drainRemainingResults(); err != nil {
@@ -232,7 +273,7 @@ func (c *Conn) readResultFromFirstPacket(packet []byte) (driver.Result, error) {
 		}
 		return res, nil
 	case protocol.ErrPacket:
-		return nil, parseServerError(packet)
+		return nil, c.markProtocolError(parseServerError(packet))
 	default:
 		if _, err := c.readQueryResultAfterColumnCount(packet); err != nil {
 			return nil, err
@@ -242,44 +283,121 @@ func (c *Conn) readResultFromFirstPacket(packet []byte) (driver.Result, error) {
 }
 
 func (c *Conn) readQueryResultAfterColumnCount(first []byte) (driver.Rows, error) {
+	if err := c.drainResultSetsFromFirstPacket(first); err != nil {
+		return nil, err
+	}
+	return &Rows{}, nil
+}
+
+func (c *Conn) drainResultSetsFromFirstPacket(first []byte) error {
+	for {
+		more, err := c.drainResultFromFirstPacket(first)
+		if err != nil {
+			return c.markProtocolError(err)
+		}
+		if !more {
+			return nil
+		}
+
+		first, err = c.packets.ReadPacket()
+		if err != nil {
+			return c.markProtocolError(err)
+		}
+	}
+}
+
+func (c *Conn) drainResultFromFirstPacket(first []byte) (bool, error) {
+	if len(first) == 0 {
+		return false, c.markProtocolError(io.ErrUnexpectedEOF)
+	}
+
+	switch first[0] {
+	case protocol.OKPacket:
+		_, status, err := c.handleOK(first)
+		if err != nil {
+			return false, c.markProtocolError(err)
+		}
+		return status&protocol.ServerMoreResultsExists != 0, nil
+	case protocol.ErrPacket:
+		return false, c.markProtocolError(parseServerError(first))
+	default:
+		return c.drainResultSetAfterColumnCount(first)
+	}
+}
+
+func (c *Conn) drainResultSetAfterColumnCount(first []byte) (bool, error) {
 	columnCount, _, _, err := protocol.ReadLengthEncodedInt(first)
 	if err != nil {
-		return nil, err
+		return false, c.markProtocolError(err)
 	}
 	for i := uint64(0); i < columnCount; i++ {
 		if _, err := c.packets.ReadPacket(); err != nil {
-			return nil, err
+			return false, c.markProtocolError(err)
 		}
 	}
-	if err := c.readEOFOrOK(); err != nil {
-		return nil, err
+
+	resultSetOK := c.deprecateEOF
+	if !c.deprecateEOF {
+		metadataTerminator, err := c.readResultSetTerminatorPacket()
+		if err != nil {
+			return false, err
+		}
+		resultSetOK = isResultSetOKPacket(metadataTerminator)
 	}
-	const maxDrainRows = 10000
 	for i := 0; i < maxDrainRows; i++ {
 		packet, err := c.packets.ReadPacket()
 		if err != nil {
-			return nil, err
+			return false, c.markProtocolError(err)
 		}
-		if isEOFOrOK(packet) {
-			return &Rows{}, nil
+		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
+			return false, c.markProtocolError(parseServerError(packet))
+		}
+		if isResultSetTerminatorForMode(packet, resultSetOK) {
+			return resultSetTerminatorHasMoreResults(packet), nil
 		}
 	}
+
 	c.bad.Store(true)
-	return nil, fmt.Errorf("oceanbase: readQueryResultAfterColumnCount exceeded %d rows, possible protocol desync", maxDrainRows)
+	return false, fmt.Errorf("oceanbase: result-set drain exceeded %d rows, possible protocol desync", maxDrainRows)
 }
 
 func (c *Conn) readEOFOrOK() error {
+	_, err := c.readEOFOrOKPacket()
+	return err
+}
+
+func (c *Conn) readEOFOrOKPacket() ([]byte, error) {
 	packet, err := c.packets.ReadPacket()
 	if err != nil {
-		return err
+		return nil, c.markProtocolError(err)
 	}
 	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
-		return parseServerError(packet)
+		return nil, c.markProtocolError(parseServerError(packet))
 	}
 	if !isEOFOrOK(packet) {
-		return fmt.Errorf("expected EOF/OK packet, got 0x%02x", packet[0])
+		if len(packet) == 0 {
+			return nil, c.markProtocolError(io.ErrUnexpectedEOF)
+		}
+		return nil, c.markProtocolError(fmt.Errorf("expected EOF/OK packet, got 0x%02x", packet[0]))
 	}
-	return nil
+	return packet, nil
+}
+
+func (c *Conn) readResultSetTerminatorPacket() ([]byte, error) {
+	packet, err := c.packets.ReadPacket()
+	if err != nil {
+		return nil, c.markProtocolError(err)
+	}
+	if len(packet) > 0 && packet[0] == protocol.ErrPacket {
+		return nil, c.markProtocolError(parseServerError(packet))
+	}
+	if !isResultSetTerminatorPacket(packet) {
+		if len(packet) == 0 {
+			return nil, c.markProtocolError(io.ErrUnexpectedEOF)
+		}
+		return nil, c.markProtocolError(fmt.Errorf("expected result-set EOF/OK packet, got 0x%02x", packet[0]))
+	}
+	return packet, nil
 }
 
 func isEOFOrOK(packet []byte) bool {
@@ -290,16 +408,87 @@ func isEOFOrOK(packet []byte) bool {
 	case protocol.ErrPacket:
 		return false
 	case protocol.OKPacket:
-		_, used, _, err := protocol.ReadLengthEncodedInt(packet[1:])
-		if err != nil {
-			return false
-		}
-		_, _, _, err = protocol.ReadLengthEncodedInt(packet[1+used:])
-		return err == nil
+		return isOKPacket(packet)
 	case protocol.EOFPacket:
-		return true
+		return isResultSetTerminatorPacket(packet)
 	}
 	return false
+}
+
+func isEOFPacket(packet []byte) bool {
+	return (len(packet) == 1 || len(packet) == 5) && packet[0] == protocol.EOFPacket
+}
+
+func isOKPacket(packet []byte) bool {
+	return isOKPacketWithHeader(packet, protocol.OKPacket)
+}
+
+func isResultSetOKPacket(packet []byte) bool {
+	return isOKPacketWithHeader(packet, protocol.EOFPacket)
+}
+
+func isResultSetTerminatorPacket(packet []byte) bool {
+	return isEOFPacket(packet) || isResultSetOKPacket(packet)
+}
+
+func isResultSetTerminatorForMode(packet []byte, resultSetOK bool) bool {
+	if resultSetOK {
+		return isResultSetOKPacket(packet)
+	}
+	return isEOFPacket(packet)
+}
+
+func resultSetTerminatorHasMoreResults(packet []byte) bool {
+	if isEOFPacket(packet) {
+		if len(packet) < 5 {
+			return false
+		}
+		return binary.LittleEndian.Uint16(packet[3:5])&protocol.ServerMoreResultsExists != 0
+	}
+	status, ok := packetStatusFlags(packet, protocol.EOFPacket)
+	return ok && status&protocol.ServerMoreResultsExists != 0
+}
+
+func isOKPacketWithHeader(packet []byte, header byte) bool {
+	_, ok := packetStatusFlags(packet, header)
+	return ok
+}
+
+func packetStatusFlags(packet []byte, header byte) (uint16, bool) {
+	if len(packet) == 0 || packet[0] != header {
+		return 0, false
+	}
+	_, used, _, err := protocol.ReadLengthEncodedInt(packet[1:])
+	if err != nil {
+		return 0, false
+	}
+	pos := 1 + used
+	_, used, _, err = protocol.ReadLengthEncodedInt(packet[pos:])
+	if err != nil {
+		return 0, false
+	}
+	pos += used
+	if len(packet) < pos+4 {
+		return 0, false
+	}
+	status := binary.LittleEndian.Uint16(packet[pos : pos+2])
+	pos += 4 // status flags and warnings
+	if pos == len(packet) {
+		return status, true
+	}
+	_, used, _, err = protocol.ReadLengthEncodedString(packet[pos:])
+	if err != nil {
+		return 0, false
+	}
+	pos += used
+	if status&protocol.ServerSessionStateChanged != 0 {
+		_, used, _, err = protocol.ReadLengthEncodedString(packet[pos:])
+		if err != nil {
+			return 0, false
+		}
+		pos += used
+	}
+	return status, pos == len(packet)
 }
 
 func parseColumnDefinition(packet []byte) (columnDef, error) {
@@ -336,6 +525,10 @@ func parseColumnDefinition(packet []byte) (columnDef, error) {
 }
 
 func parseTextRow(packet []byte, columnCount int, types []byte) ([]driver.Value, error) {
+	return parseTextRowInLocation(packet, columnCount, types, time.UTC)
+}
+
+func parseTextRowInLocation(packet []byte, columnCount int, types []byte, sessionLocation *time.Location) ([]driver.Value, error) {
 	row := make([]driver.Value, columnCount)
 	pos := 0
 	for i := 0; i < columnCount; i++ {
@@ -356,7 +549,14 @@ func parseTextRow(packet []byte, columnCount int, types []byte) ([]driver.Value,
 		if i < len(types) {
 			typ = types[i]
 		}
-		row[i] = textValue(raw, typ)
+		value, err := textValueInLocation(raw, typ, sessionLocation)
+		if err != nil {
+			return nil, err
+		}
+		row[i] = value
+	}
+	if pos != len(packet) {
+		return nil, fmt.Errorf("oceanbase: text row has %d trailing bytes", len(packet)-pos)
 	}
 	return row, nil
 }
@@ -382,8 +582,7 @@ func textValue(raw []byte, typ byte) driver.Value {
 		}
 	case protocol.ColumnTypeDecimal, protocol.ColumnTypeNewDecimal:
 		return s
-	case protocol.ColumnTypeDate, protocol.ColumnTypeDateTime, protocol.ColumnTypeTimestamp,
-		protocol.ColumnTypeOracleTimestampNano, protocol.ColumnTypeOracleTimestampTZ, protocol.ColumnTypeOracleTimestampLTZ:
+	case protocol.ColumnTypeDate, protocol.ColumnTypeDateTime, protocol.ColumnTypeTimestamp:
 		formats := []string{
 			"2006-01-02 15:04:05.999999999",
 			"2006-01-02 15:04:05",
@@ -412,6 +611,13 @@ func textValue(raw []byte, typ byte) driver.Value {
 		return s
 	}
 	return s
+}
+
+func textValueInLocation(raw []byte, typ byte, sessionLocation *time.Location) (driver.Value, error) {
+	if protocol.IsOracleTimeType(typ) {
+		return protocol.ParseOracleTime(raw, typ, sessionLocation)
+	}
+	return textValue(raw, typ), nil
 }
 
 func databaseTypeName(typ byte) string {
@@ -470,6 +676,8 @@ func databaseTypeName(typ byte) string {
 		return "STRING"
 	case protocol.ColumnTypeGeometry:
 		return "GEOMETRY"
+	case protocol.ColumnTypeOracleTimestampNano:
+		return "TIMESTAMP"
 	case protocol.ColumnTypeOracleTimestampTZ:
 		return "TIMESTAMP WITH TIME ZONE"
 	case protocol.ColumnTypeOracleTimestampLTZ:
@@ -505,7 +713,8 @@ func scanType(typ byte) reflect.Type {
 		return reflect.TypeOf(float64(0))
 	case protocol.ColumnTypeDecimal, protocol.ColumnTypeNewDecimal:
 		return reflect.TypeOf("")
-	case protocol.ColumnTypeDate, protocol.ColumnTypeDateTime, protocol.ColumnTypeTimestamp:
+	case protocol.ColumnTypeDate, protocol.ColumnTypeDateTime, protocol.ColumnTypeTimestamp,
+		protocol.ColumnTypeOracleTimestampNano, protocol.ColumnTypeOracleTimestampTZ, protocol.ColumnTypeOracleTimestampLTZ:
 		return reflect.TypeOf(time.Time{})
 	case protocol.ColumnTypeTinyBlob,
 		protocol.ColumnTypeMediumBlob,

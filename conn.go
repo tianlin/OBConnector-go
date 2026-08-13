@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"strconv"
@@ -19,13 +20,15 @@ import (
 )
 
 type Conn struct {
-	netConn       net.Conn
-	packets       *protocol.PacketConn
-	cfg           *Config
-	db            string
-	ob20Confirmed bool
-	ob20Declined  bool
-	tenantMode    string
+	netConn         net.Conn
+	packets         *protocol.PacketConn
+	cfg             *Config
+	db              string
+	ob20Confirmed   bool
+	ob20Declined    bool
+	deprecateEOF    bool
+	tenantMode      string
+	sessionLocation *time.Location
 
 	mu     sync.Mutex
 	closed bool
@@ -91,15 +94,18 @@ func (c *Conn) ResetSession(ctx context.Context) error {
 	if err := c.checkUsableLocked(); err != nil {
 		return err
 	}
-	if !c.inTx {
+	if c.inTx {
+		c.tracef("reset session: rollback active transaction")
+		if _, err := c.execLocked(ctx, "rollback"); err != nil {
+			return c.markSessionResetError(err)
+		}
+		c.inTx = false
+	} else {
 		c.tracef("reset session: no active transaction")
-		return nil
 	}
-	c.tracef("reset session: rollback active transaction")
-	if _, err := c.execLocked(ctx, "rollback"); err != nil {
-		return c.markBadIfConnErr(err)
+	if err := c.configureSessionTimeZone(ctx); err != nil {
+		return c.markSessionResetError(err)
 	}
-	c.inTx = false
 	return nil
 }
 
@@ -137,10 +143,13 @@ func (c *Conn) Ping(ctx context.Context) error {
 		}
 		packet, err := c.packets.ReadPacket()
 		if err != nil {
-			return err
+			return c.markProtocolError(err)
 		}
-		if len(packet) > 0 && packet[0] == protocol.ErrPacket {
-			return parseServerError(packet)
+		if len(packet) == 0 {
+			return c.markProtocolError(io.ErrUnexpectedEOF)
+		}
+		if packet[0] == protocol.ErrPacket {
+			return c.markProtocolError(parseServerError(packet))
 		}
 		return nil
 	})
@@ -233,6 +242,9 @@ func (c *Conn) queryLocked(ctx context.Context, query string) (driver.Rows, erro
 		if err != nil {
 			return err
 		}
+		if err := c.updateSessionTimeZoneFromQuery(query); err != nil {
+			return err
+		}
 		rows = r
 		return nil
 	})
@@ -247,13 +259,16 @@ func (c *Conn) execLocked(ctx context.Context, query string) (driver.Result, err
 		}
 		first, err := c.packets.ReadPacket()
 		if err != nil {
-			return err
+			return c.markProtocolError(err)
 		}
 		res, err := c.readResultFromFirstPacket(first)
 		if err != nil {
 			return err
 		}
 		result = res
+		if err := c.updateSessionTimeZoneFromQuery(query); err != nil {
+			return err
+		}
 		return nil
 	})
 	return result, err
@@ -304,6 +319,32 @@ func (c *Conn) markBadIfConnErr(err error) error {
 		return driver.ErrBadConn
 	}
 	return err
+}
+
+func (c *Conn) markProtocolError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var serverErr *ServerError
+	if errors.As(err, &serverErr) {
+		return err
+	}
+	c.bad.Store(true)
+	if errors.Is(err, driver.ErrBadConn) {
+		return err
+	}
+	return fmt.Errorf("oceanbase: protocol error: %v: %w", err, driver.ErrBadConn)
+}
+
+func (c *Conn) markSessionResetError(err error) error {
+	if err == nil {
+		return nil
+	}
+	c.bad.Store(true)
+	if errors.Is(err, driver.ErrBadConn) {
+		return err
+	}
+	return fmt.Errorf("oceanbase: session reset failed: %w: %w", err, driver.ErrBadConn)
 }
 
 func (c *Conn) withDeadline(ctx context.Context, fn func() error) error {
@@ -377,6 +418,9 @@ func (c *Conn) handleOK(packet []byte) (res driver.Result, status uint16, err er
 	pos += used
 
 	if pos < len(packet) {
+		if len(packet) < pos+4 {
+			return nil, 0, io.ErrUnexpectedEOF
+		}
 		status = binary.LittleEndian.Uint16(packet[pos : pos+2])
 		pos += 2
 		pos += 2 // skip warnings

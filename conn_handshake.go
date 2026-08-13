@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/helingjun/obconnector-go/internal/protocol"
 )
@@ -52,9 +53,52 @@ func dialAndHandshake(ctx context.Context, cfg *Config) (*Conn, error) {
 				return nil, fmt.Errorf("init query %q failed: %w", query, err)
 			}
 		}
+		if err := c.configureSessionTimeZone(ctx); err != nil {
+			_ = netConn.Close()
+			return nil, fmt.Errorf("configure session time zone failed: %w", err)
+		}
 		return c, nil
 	}
 	return nil, lastErr
+}
+
+func (c *Conn) configureSessionTimeZone(ctx context.Context) error {
+	if c.cfg == nil {
+		c.sessionLocation = time.UTC
+		return nil
+	}
+	location, canonical, enabled, err := resolveSessionTimeZone(c.tenantMode, c.cfg.SessionTimeZone)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		c.sessionLocation = time.UTC
+		return nil
+	}
+	c.tracef("session time zone: %s", canonical)
+	if _, err := c.execLocked(ctx, sessionTimeZoneSQL(canonical)); err != nil {
+		return err
+	}
+	c.sessionLocation = location
+	return nil
+}
+
+func tenantModeFromHandshake(status uint16, cfg *Config) string {
+	if cfg != nil {
+		switch strings.ToLower(strings.TrimSpace(cfg.OracleMode)) {
+		case "true", "oracle":
+			return "oracle"
+		case "false", "mysql":
+			return "mysql"
+		}
+		if strings.EqualFold(cfg.Preset, "oboracle") {
+			return "oracle"
+		}
+	}
+	if status&protocol.ServerOracleMode != 0 {
+		return "oracle"
+	}
+	return "mysql"
 }
 
 func (c *Conn) handshake() error {
@@ -82,18 +126,17 @@ func (c *Conn) handshake() error {
 		len(hs.authSeed),
 	)
 
-	if hs.status&0x0004 != 0 {
-		c.tenantMode = "oracle"
-	} else {
-		c.tenantMode = "mysql"
-	}
+	// Some Oracle tenants (including the standalone observer) advertise a zero
+	// handshake status, so an explicit mode or the oboracle preset is also
+	// authoritative.
+	c.tenantMode = tenantModeFromHandshake(hs.status, c.cfg)
 
 	if c.cfg.TLSConfig != nil {
 		if hs.capabilities&protocol.ClientSSL == 0 {
 			return errors.New("oceanbase: server does not support SSL")
 		}
 		c.tracef("sending SSLRequest")
-		if err := c.sendSSLRequest(); err != nil {
+		if err := c.sendSSLRequest(hs.capabilities); err != nil {
 			return err
 		}
 
@@ -123,6 +166,7 @@ func (c *Conn) handshake() error {
 	}
 
 	response := c.buildHandshakeResponse(hs, authResp)
+	c.deprecateEOF = binary.LittleEndian.Uint32(response[:4])&protocol.ClientDeprecateEOF != 0
 	c.tracef("client handshake response: payload_len=%d", len(response))
 	if err := c.packets.WritePacket(response); err != nil {
 		return err
@@ -234,7 +278,7 @@ func (c *Conn) readAuthSwitchData() (string, []byte, error) {
 	return plugin, seed, nil
 }
 
-func (c *Conn) sendSSLRequest() error {
+func (c *Conn) sendSSLRequest(serverCapabilities uint32) error {
 	caps := protocol.ClientLongPassword |
 		protocol.ClientLongFlag |
 		protocol.ClientProtocol41 |
@@ -245,9 +289,13 @@ func (c *Conn) sendSSLRequest() error {
 		protocol.ClientPluginAuthLenencClientData |
 		protocol.ClientConnectAttrs |
 		protocol.ClientSessionTrack |
+		protocol.ClientDeprecateEOF |
 		protocol.ClientSupportOracleMode |
 		protocol.ClientCanHandleExpiredPasswords |
 		protocol.ClientSSL
+	if serverCapabilities&protocol.ClientDeprecateEOF == 0 || c.cfg.CapabilityDrop&protocol.ClientDeprecateEOF != 0 {
+		caps &^= protocol.ClientDeprecateEOF
+	}
 
 	payload := make([]byte, 32)
 	binary.LittleEndian.PutUint32(payload[0:4], caps)
@@ -280,6 +328,7 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 		protocol.ClientPluginAuthLenencClientData |
 		protocol.ClientConnectAttrs |
 		protocol.ClientSessionTrack |
+		protocol.ClientDeprecateEOF |
 		protocol.ClientSupportOracleMode |
 		protocol.ClientCanHandleExpiredPasswords
 	if c.cfg.TLSConfig != nil {
@@ -295,6 +344,9 @@ func (c *Conn) buildHandshakeResponse(hs *handshake, authResp []byte) []byte {
 	}
 	caps |= c.cfg.CapabilityAdd
 	caps &^= c.cfg.CapabilityDrop
+	if hs.capabilities&protocol.ClientDeprecateEOF == 0 {
+		caps &^= protocol.ClientDeprecateEOF
+	}
 
 	envOverride := os.Getenv("OB_USE_COMPRESSION")
 	negotiatedCompress := NegotiateCompression(c.cfg.UseCompression, hs.capabilities, envOverride)

@@ -45,6 +45,17 @@ func TestDriverOpenConnectorOpaque(t *testing.T) {
 	}
 }
 
+func TestOracleDriverForcesOraclePreset(t *testing.T) {
+	d := &Driver{preset: "oboracle"}
+	connector, err := d.OpenConnector("user:pass@tcp(127.0.0.1:2881)/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := connector.(*Connector).cfg.Preset; got != "oboracle" {
+		t.Fatalf("preset = %q, want oboracle", got)
+	}
+}
+
 func TestDriverOpenConnectorInvalid(t *testing.T) {
 	d := &Driver{}
 	_, err := d.OpenConnector("invalid-dsn")

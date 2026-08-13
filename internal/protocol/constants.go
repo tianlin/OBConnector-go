@@ -76,6 +76,7 @@ const (
 	ServerSessionStateChanged uint16 = 0x4000
 	ServerPSOutParams         uint16 = 0x1000
 	ServerMoreResultsExists   uint16 = 0x0008
+	ServerOracleMode          uint16 = 0x0004
 )
 
 const (
